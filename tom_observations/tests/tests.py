@@ -309,7 +309,8 @@ class TestCallbackView(TestCase):
         url = reverse('tom_observations:callback') + callback_params
         response = self.client.get(url)
         observation = ObservationRecord.objects.get(target=self.target, facility='FakeRoboticFacility')
-        self.assertRedirects(response, reverse('tom_observations:detail', kwargs={'pk': observation.pk}))
+        group = observation.observationgroup_set.first()
+        self.assertRedirects(response, reverse('tom_observations:list') + f"?observationgroup={group.id}")
 
 
 @override_settings(TOM_FACILITY_CLASSES=['tom_observations.tests.utils.FakeRoboticFacility'])
@@ -318,7 +319,8 @@ class TestFacilityStatusView(TestCase):
         pass
 
     def test_facility_status(self):
-        response = self.client.get(reverse('tom_observations:facility-status'))
+        response = self.client.get(
+            reverse('tom_observations:render-facility-status-list'))
         self.assertEqual(response.status_code, 200)
         self.assertContains(response, 'coj.domb.1m0a', status_code=HTTPStatus.OK)
 
