@@ -1,28 +1,53 @@
-import datetime
+from copy import deepcopy
+from urllib.parse import urlencode
+from datetime import timedelta
 from http import HTTPStatus
+from pathlib import Path
+from io import StringIO
+from types import ModuleType, SimpleNamespace
+import base64
+import sys
 import tempfile
+import time
 import logging
-from unittest.mock import MagicMock, patch
+import re
 
-from cryptography.fernet import Fernet
+from allauth.mfa.adapter import get_adapter as get_mfa_adapter
+from allauth.mfa.models import Authenticator
+from allauth.mfa.totp.internal import auth as totp_auth
+from cryptography.fernet import InvalidToken
+from guardian.shortcuts import assign_perm
 
-from django.contrib.auth.models import User
-from django.contrib.sessions.models import Session
+from django import forms
+from django.conf import settings as django_settings
+from django.contrib.auth.models import Permission, User
+from django.contrib.contenttypes.models import ContentType
+from django.core.cache import cache
 from django.contrib.sites.models import Site
-from django.urls import reverse
+from django.core.exceptions import FieldError, ValidationError
+from django.core.mail.backends.base import BaseEmailBackend
+from django.core.management import call_command
+from django.urls import NoReverseMatch, clear_url_caches, resolve, reverse
 from django_comments.models import Comment
+from rest_framework.authtoken.models import Token
 from django.core.paginator import Paginator
-from django.db.models import QuerySet
-from django.test import TestCase, override_settings
+from django.test import Client, TestCase, override_settings
 from django.test.runner import DiscoverRunner
+from django.utils import timezone
 
-from tom_common.models import UserSession
-from tom_common import session_utils  # noqa Import the whole module for patching
-from tom_common.session_utils import (get_key_from_session_store, get_key_from_session_model,
-                                      SESSION_KEY_FOR_CIPHER_ENCRYPTION_KEY)
+from tom_common.middleware import ExternalServiceMiddleware
+from tom_common.models import Profile
+from tom_common import encryption
+from tom_common.encryption import (
+    ClearableEncryptedInput,
+    EncryptedFormField,
+    EncryptedModelField,
+    _CLEAR_EXISTING_VALUE,
+    _KEEP_EXISTING_VALUE,
+)
 from tom_targets.tests.factories import SiderealTargetFactory
 from tom_common.templatetags.tom_common_extras import verbose_name, multiplyby, truncate_value_for_display
-from tom_common.templatetags.bootstrap4_overrides import bootstrap_pagination
+from tom_common.templatetags.bootstrap5_overrides import bootstrap_pagination
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -350,6 +375,1206 @@ class TestAuthStrategyMiddleware(TestCase):
         self.assertEqual(response.status_code, 200)
 
 
+class TestAllauthURLConf(TestCase):
+    """The allauth URL cutover: historical URL names keep working and password-only logins are closed."""
+
+    def test_login_and_logout_names_are_aliases(self):
+        """``login``/``logout`` and ``account_login``/``account_logout`` reverse to the same paths."""
+        self.assertEqual(reverse('login'), reverse('account_login'))
+        self.assertEqual(reverse('logout'), reverse('account_logout'))
+
+    def test_login_path_is_served_by_allauth(self):
+        """allauth is mounted before the plugin loop and the aliases, so its view answers the path."""
+        self.assertEqual(resolve(reverse('login')).url_name, 'account_login')
+        response = self.client.get(reverse('login'))
+        # allauth's login form posts a 'login' field where Django's posted 'username'
+        self.assertContains(response, 'name="login"')
+        self.assertContains(response, 'name="password"')
+
+    def test_browsable_api_login_redirects_to_tom_login(self):
+        """The REST framework's password-only login page must not bypass two-factor authentication."""
+        response = self.client.get(reverse('rest_framework:login') + '?next=/api/')
+        self.assertRedirects(
+            response, reverse('account_login') + '?next=/api/', fetch_redirect_response=False
+        )
+
+
+class TestSecureAdminLogin(TestCase):
+    """The Django admin's password-only login page must route through the TOM (allauth) login."""
+
+    def test_admin_login_redirects_to_tom_login(self):
+        response = self.client.get('/admin/login/?next=/admin/')
+        self.assertRedirects(
+            response, reverse('account_login') + '?next=%2Fadmin%2F', fetch_redirect_response=False
+        )
+
+    def test_admin_usable_with_an_authenticated_session(self):
+        admin_user = User.objects.create_user(username='admin_user', password='password',
+                                              is_staff=True, is_superuser=True)
+        self.client.force_login(admin_user)
+        self.assertEqual(self.client.get('/admin/').status_code, HTTPStatus.OK)
+        # an already-authenticated user hitting the admin login page is sent on, not asked again
+        response = self.client.get('/admin/login/?next=/admin/')
+        self.assertRedirects(response, '/admin/', fetch_redirect_response=False)
+
+
+class TestExternalServiceMiddleware(TestCase):
+    def test_unrelated_exceptions_are_left_to_other_middleware(self):
+        """process_exception must return None for exceptions it does not handle.
+
+        Re-raising prevented later exception middleware (allauth's AccountMiddleware) from
+        converting its control-flow exceptions into redirects, producing 500s instead.
+        """
+        middleware = ExternalServiceMiddleware(lambda request: None)
+        self.assertIsNone(middleware.process_exception(None, ValueError('unrelated')))
+
+
+# The test TOM's terms of service live in tom_common/test_templates/, shadowing the shipped
+# placeholder partial exactly the way a real TOM's templates/ directory would — so these
+# tests also prove the documented override mechanism.
+_TEMPLATES_WITH_TEST_TERMS = deepcopy(django_settings.TEMPLATES)
+_TEMPLATES_WITH_TEST_TERMS[0]['DIRS'] = (
+    [str(Path(__file__).parent / 'test_templates')] + list(_TEMPLATES_WITH_TEST_TERMS[0]['DIRS'])
+)
+MARAUDERS_OATH = 'I solemnly swear that I am up to no good.'
+
+
+def with_next(target_url: str, destination_url: str) -> str:
+    """The requirement middleware's redirect: target plus the interrupted destination as ?next=."""
+    return f'{target_url}?{urlencode({"next": destination_url})}'
+
+
+@override_settings(TEMPLATES=_TEMPLATES_WITH_TEST_TERMS)
+class TestTermsOfService(TestCase):
+    def setUp(self):
+        cache.clear()
+        self.user = User.objects.create_user(username='tos_user', password='password')
+        self.client.force_login(self.user)
+
+    def test_terms_page_is_public_and_shows_the_toms_terms(self):
+        response = Client().get(reverse('terms-of-service'))
+        self.assertEqual(response.status_code, HTTPStatus.OK)
+        self.assertContains(response, MARAUDERS_OATH)
+
+    def test_inactive_when_no_version_configured(self):
+        self.assertEqual(self.client.get(reverse('user-profile')).status_code, HTTPStatus.OK)
+
+    @override_settings(TOM_TERMS_OF_SERVICE_VERSION='v1')
+    def test_acceptance_flow(self):
+        from tom_common.models import TermsOfServiceAcceptance
+        # unaccepted: redirected to the accept page
+        response = self.client.get(reverse('user-profile'))
+        self.assertRedirects(response, with_next(reverse('terms-accept'), reverse('user-profile')),
+                             fetch_redirect_response=False)
+        # the accept page itself renders (exempt from the check) and shows this TOM's terms
+        accept_page = self.client.get(reverse('terms-accept'))
+        self.assertEqual(accept_page.status_code, HTTPStatus.OK)
+        self.assertContains(accept_page, MARAUDERS_OATH)
+        # accepting records version and IP and unblocks
+        self.client.post(reverse('terms-accept'))
+        acceptance = TermsOfServiceAcceptance.objects.get(user=self.user)
+        self.assertEqual(acceptance.version, 'v1')
+        self.assertIsNotNone(acceptance.ip_address)
+        self.assertEqual(self.client.get(reverse('user-profile')).status_code, HTTPStatus.OK)
+        # bumping the version requires re-acceptance; the old record remains for the audit trail
+        with override_settings(TOM_TERMS_OF_SERVICE_VERSION='v2'):
+            self.assertEqual(self.client.get(reverse('user-profile')).status_code, HTTPStatus.FOUND)
+            self.client.post(reverse('terms-accept'))
+        self.assertEqual(TermsOfServiceAcceptance.objects.filter(user=self.user).count(), 2)
+
+    @override_settings(TOM_TERMS_OF_SERVICE_VERSION='v1', TOM_MFA_REQUIRED='all')
+    def test_terms_check_runs_first(self):
+        response = self.client.get(reverse('user-profile'))
+        self.assertRedirects(response, with_next(reverse('terms-accept'), reverse('user-profile')),
+                             fetch_redirect_response=False)
+
+
+class TestRegistrationStrategies(TestCase):
+    """TOM_REGISTRATION_STRATEGY: closed (default), 'open', and 'approval_required'."""
+
+    SIGNUP_DATA = {
+        'username': 'new_astronomer', 'email': 'new@example.com',
+        'password1': 'a-strong-password-1!', 'password2': 'a-strong-password-1!',
+        'first_name': 'Willa', 'affiliation': 'LCO',
+    }
+
+    def setUp(self):
+        cache.clear()
+
+    @override_settings(TOM_REGISTRATION_STRATEGY='open')
+    def test_open_signup_creates_active_logged_in_user_with_fields(self):
+        self.assertTemplateUsed(self.client.get(reverse('account_signup')), 'account/signup.html')
+        response = self.client.post(reverse('account_signup'), self.SIGNUP_DATA)
+        self.assertEqual(response.status_code, HTTPStatus.FOUND)
+        user = User.objects.get(username='new_astronomer')
+        self.assertTrue(user.is_active)
+        self.assertEqual(user.first_name, 'Willa')
+        self.assertEqual(user.profile.affiliation, 'LCO')
+        self.assertTrue(user.groups.filter(name='Public').exists())
+        self.assertEqual(int(self.client.session['_auth_user_id']), user.pk)  # logged in
+
+    @override_settings(TOM_REGISTRATION_STRATEGY='approval_required',
+                       MANAGERS=[('Admin', 'admin@example.com')])
+    def test_approval_required_signup_creates_inactive_user_and_notifies_managers(self):
+        from django.core import mail
+        response = self.client.post(reverse('account_signup'), self.SIGNUP_DATA)
+        self.assertEqual(response.status_code, HTTPStatus.FOUND)
+        user = User.objects.get(username='new_astronomer')
+        self.assertFalse(user.is_active)
+        self.assertTrue(user.groups.filter(name='Public').exists())
+        self.assertNotIn('_auth_user_id', self.client.session)  # not logged in
+        self.assertEqual(len(mail.outbox), 1)
+        self.assertIn('awaiting approval', mail.outbox[0].subject)
+        # a login attempt shows the pending-approval page, with the next step named
+        login_response = Client().post(reverse('login'),
+                                       {'login': 'new_astronomer', 'password': 'a-strong-password-1!'},
+                                       follow=True)
+        self.assertContains(login_response, 'awaiting approval')
+
+    @override_settings(TOM_REGISTRATION_STRATEGY='open', TOM_REQUIRED_USER_FIELDS=['phone_number'])
+    def test_signup_enforces_required_fields(self):
+        response = self.client.post(reverse('account_signup'), self.SIGNUP_DATA)
+        self.assertEqual(response.status_code, HTTPStatus.OK)  # re-rendered with errors
+        self.assertFalse(User.objects.filter(username='new_astronomer').exists())
+
+    @override_settings(TOM_REGISTRATION_STRATEGY='open', TOM_TERMS_OF_SERVICE_VERSION='v1')
+    def test_signup_requires_and_records_terms_acceptance(self):
+        from tom_common.models import TermsOfServiceAcceptance
+        response = self.client.post(reverse('account_signup'), self.SIGNUP_DATA)
+        self.assertEqual(response.status_code, HTTPStatus.OK)  # checkbox missing: form error
+        response = self.client.post(reverse('account_signup'),
+                                    {**self.SIGNUP_DATA, 'accept_terms': 'on'})
+        self.assertEqual(response.status_code, HTTPStatus.FOUND)
+        acceptance = TermsOfServiceAcceptance.objects.get(user__username='new_astronomer')
+        self.assertEqual(acceptance.version, 'v1')
+
+    @override_settings(TOM_REGISTRATION_STRATEGY='open', TOM_TERMS_OF_SERVICE_VERSION='v1')
+    def test_terms_checkbox_label_links_the_terms(self):
+        response = self.client.get(reverse('account_signup'))
+        self.assertContains(response, f'href="{reverse("terms-of-service")}"')
+
+    def test_signup_closed_by_default_creates_nothing(self):
+        response = self.client.post(reverse('account_signup'), self.SIGNUP_DATA)
+        self.assertTemplateUsed(response, 'account/signup_closed.html')
+        self.assertFalse(User.objects.filter(username='new_astronomer').exists())
+
+
+class TestHideOtherUsers(TestCase):
+    """Test the TOM_HIDE_OTHER_USERS setting.
+
+    When unset or set to `False`: all users are listed on the /users/ page.
+
+    When set to `True`, TOM_HIDE_OTHER_USERS: /users/ shows other users only
+    to holders of `auth.view_user` permission. (Superusers hold all permissions).
+    A user's own row is always shown.
+    """
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.viewer = User.objects.create_user(username='ordinary_viewer', password='password')
+        cls.colleague = User.objects.create_user(username='visible_colleague', password='password')
+        cls.stranger = User.objects.create_user(username='invisible_stranger', password='password')
+        cls.superuser = User.objects.create_user(username='listing_superuser', password='password',
+                                                 is_superuser=True)
+
+    def user_list_page(self, user):
+        self.client.force_login(user)
+        return self.client.get(reverse('user-list'))
+
+    def test_default_shows_everyone(self):
+        response = self.user_list_page(self.viewer)
+        self.assertContains(response, 'visible_colleague')
+        self.assertContains(response, 'invisible_stranger')
+
+    @override_settings(TOM_HIDE_OTHER_USERS=True)
+    def test_hidden_shows_only_the_viewers_own_row(self):
+        response = self.user_list_page(self.viewer)
+        self.assertContains(response, 'ordinary_viewer')
+        self.assertNotContains(response, 'visible_colleague')
+        self.assertNotContains(response, 'invisible_stranger')
+
+    @override_settings(TOM_HIDE_OTHER_USERS=True)
+    def test_superusers_always_see_everyone(self):
+        response = self.user_list_page(self.superuser)
+        self.assertContains(response, 'ordinary_viewer')
+        self.assertContains(response, 'invisible_stranger')
+
+    @override_settings(TOM_HIDE_OTHER_USERS=True)
+    def test_the_model_level_permission_shows_everyone(self):
+        view_user = Permission.objects.get(codename='view_user',
+                                           content_type=ContentType.objects.get_for_model(User))
+        self.viewer.user_permissions.add(view_user)
+        response = self.user_list_page(self.viewer)
+        self.assertContains(response, 'visible_colleague')
+        self.assertContains(response, 'invisible_stranger')
+
+    @override_settings(TOM_HIDE_OTHER_USERS=True)
+    def test_an_object_level_grant_shows_those_users_only(self):
+        assign_perm('auth.view_user', self.viewer, self.colleague)
+        response = self.user_list_page(self.viewer)
+        self.assertContains(response, 'ordinary_viewer')  # own row always shown
+        self.assertContains(response, 'visible_colleague')
+        self.assertNotContains(response, 'invisible_stranger')
+
+
+class AlwaysFailingEmailBackend(BaseEmailBackend):
+    """Email backend whose every send raises ConnectionRefusedError.
+
+    Set as EMAIL_BACKEND in TestEmailDegradation tests below to verify that
+    approval-notification and password-reset sends degrade gracefully when the
+    SMTP server is unreachable.
+    """
+    def send_messages(self, email_messages):
+        raise ConnectionRefusedError('no relay here')
+
+
+UNCONFIGURED_EMAIL = {'EMAIL_BACKEND': 'django.core.mail.backends.smtp.EmailBackend',
+                      'EMAIL_HOST': 'localhost', 'EMAIL_HOST_USER': ''}
+
+
+class TestEmailDegradation(TestCase):
+    """approval_required and password reset degrade gracefully without working email."""
+
+    def setUp(self):
+        cache.clear()
+        self.superuser = User.objects.create_user(username='mailless_admin', password='password',
+                                                  is_staff=True, is_superuser=True)
+        self.pending = User.objects.create_user(username='mailless_applicant', password='password',
+                                                email='applicant@example.com', is_active=False)
+
+    def test_email_is_configured_heuristic(self):
+        from tom_common.accounts.email import email_is_configured
+        with override_settings(**UNCONFIGURED_EMAIL):
+            self.assertFalse(email_is_configured())
+        with override_settings(EMAIL_BACKEND='django.core.mail.backends.console.EmailBackend'):
+            self.assertTrue(email_is_configured())
+        with override_settings(EMAIL_BACKEND='django.core.mail.backends.smtp.EmailBackend',
+                               EMAIL_HOST='smtp.example.com'):
+            self.assertTrue(email_is_configured())
+
+    @override_settings(EMAIL_BACKEND='tom_common.tests.AlwaysFailingEmailBackend',
+                       TOM_REGISTRATION_STRATEGY='approval_required')
+    def test_failed_approval_email_warns_the_approver(self):
+        self.client.force_login(self.superuser)
+        response = self.client.post(reverse('user-approve', kwargs={'pk': self.pending.pk}),
+                                    follow=True)
+        self.pending.refresh_from_db()
+        self.assertTrue(self.pending.is_active)  # the approval survived the email failure
+        rendered_messages = [str(m) for m in response.context['messages']]
+        self.assertTrue(any('could not be sent' in m for m in rendered_messages))
+        self.assertTrue(any('applicant@example.com' in m for m in rendered_messages))
+
+    @override_settings(TOM_REGISTRATION_STRATEGY='approval_required', **UNCONFIGURED_EMAIL)
+    def test_pending_table_warns_when_email_unconfigured(self):
+        self.client.force_login(self.superuser)
+        response = self.client.get(reverse('user-list'))
+        self.assertContains(response, 'Email is not configured')
+
+    @override_settings(EMAIL_BACKEND='tom_common.tests.AlwaysFailingEmailBackend')
+    def test_password_reset_with_broken_relay_does_not_500(self):
+        self.addCleanup(TestPasswordResetOptIn._reload_urlconf)
+        with override_settings(TOM_PASSWORD_RESET_ENABLED=True):
+            TestPasswordResetOptIn._reload_urlconf()
+            response = self.client.post('/accounts/password/reset/',
+                                        {'email': 'applicant@example.com'}, follow=True)
+            self.assertEqual(response.status_code, HTTPStatus.OK)  # not a 500
+            rendered_messages = [str(m) for m in response.context['messages']]
+            self.assertTrue(any('could not be sent' in m for m in rendered_messages))
+
+    def test_w002_warns_for_email_dependent_features_without_email(self):
+        from tom_common.checks import email_prerequisite_check
+        with override_settings(TOM_REGISTRATION_STRATEGY='approval_required', **UNCONFIGURED_EMAIL):
+            warnings = email_prerequisite_check(None)
+            self.assertEqual(warnings[0].id, 'tom_common.W002')
+        with override_settings(TOM_REGISTRATION_STRATEGY='approval_required',
+                               EMAIL_BACKEND='django.core.mail.backends.console.EmailBackend'):
+            self.assertEqual(email_prerequisite_check(None), [])
+
+
+class TestLoginRouteCheck(TestCase):
+    """Test the login bypass warning mechanism (tom_common.W003, see checks.py)
+
+    tom_common.W003: warns that a TOM login route in front of the allauth login
+    bypasses the TOM Toolkit second factor.
+
+    This TestCase tests `tom_common.checks.login_route_check()`.
+    """
+
+    def call_check_with_urlconf(self, urlpatterns):
+        """Run login_route_check against a throwaway root URLconf built from urlpatterns."""
+        from tom_common.checks import login_route_check  # local, like the other check tests
+        shadow_urlconf = ModuleType('shadow_urlconf')
+        shadow_urlconf.urlpatterns = urlpatterns
+        sys.modules['shadow_urlconf'] = shadow_urlconf
+        self.addCleanup(sys.modules.pop, 'shadow_urlconf', None)
+        self.addCleanup(clear_url_caches)
+        with override_settings(ROOT_URLCONF='shadow_urlconf'):
+            clear_url_caches()
+            warnings = login_route_check(None)
+        clear_url_caches()
+        return warnings
+
+    def test_default_mounting_passes(self):
+        from tom_common.checks import login_route_check
+        self.assertEqual(login_route_check(None), [])
+
+    def test_own_login_route_warns(self):
+        from django.contrib.auth import views as django_auth_views
+        from django.urls import path as url_path
+        warnings = self.call_check_with_urlconf(
+            [url_path('accounts/login/', django_auth_views.LoginView.as_view())])
+        self.assertEqual(warnings[0].id, 'tom_common.W003')
+        self.assertIn('django.contrib.auth.views', warnings[0].msg)
+
+    def test_contrib_auth_urls_include_warns(self):
+        from django.urls import include, path as url_path
+        warnings = self.call_check_with_urlconf([url_path('accounts/', include('django.contrib.auth.urls'))])
+        self.assertEqual(warnings[0].id, 'tom_common.W003')
+
+
+class TestInterruptedDestinationRestored(TestCase):
+    """A requirement interrupt carries ?next=, and the satisfy-pages send the user onward."""
+
+    def setUp(self):
+        cache.clear()
+        self.user = User.objects.create_user(username='next_user', password='current-pass-1!')
+        self.client.force_login(self.user)
+
+    @override_settings(TOM_TERMS_OF_SERVICE_VERSION='v1')
+    def test_terms_interrupt_returns_to_destination(self):
+        destination = reverse('tom_targets:list')
+        response = self.client.get(destination)
+        self.assertEqual(response.headers['Location'], with_next(reverse('terms-accept'), destination))
+        response = self.client.post(reverse('terms-accept'), {'next': destination})
+        self.assertRedirects(response, destination, fetch_redirect_response=False)
+
+    @override_settings(TOM_PASSWORD_EXPIRY_DAYS=60)
+    def test_password_expiry_interrupt_returns_to_destination(self):
+        destination = reverse('tom_targets:list')
+        response = self.client.get(destination)
+        self.assertEqual(response.headers['Location'],
+                         with_next(reverse('account_change_password'), destination))
+        response = self.client.post(f'{reverse("account_change_password")}?next={destination}', {
+            'oldpassword': 'current-pass-1!',
+            'password1': 'a-brand-new-pass-2@', 'password2': 'a-brand-new-pass-2@',
+        })
+        self.assertRedirects(response, destination, fetch_redirect_response=False)
+
+    @override_settings(TOM_TERMS_OF_SERVICE_VERSION='v1')
+    def test_unsafe_next_is_ignored(self):
+        response = self.client.post(reverse('terms-accept'), {'next': 'https://evil.example.com/'})
+        self.assertRedirects(response, django_settings.LOGIN_REDIRECT_URL, fetch_redirect_response=False)
+
+
+class TestBlockedActionPagesExplainThemselves(TestCase):
+    """Pages for actions policy forbids explain the block instead of offering a dead control."""
+
+    def setUp(self):
+        cache.clear()
+        self.user = User.objects.create_user(username='clarity_user', password='current-pass-1!')
+
+    def _enrol_and_log_in(self):
+        """A full password + TOTP-code login (the deactivate page requires recent authentication)."""
+        secret = totp_auth.generate_totp_secret()
+        totp_auth.TOTP.activate(self.user, secret)
+        client = Client()
+        client.post(reverse('login'), {'login': 'clarity_user', 'password': 'current-pass-1!'})
+        code = totp_auth.hotp_value(secret, int(time.time() // 30))
+        client.post(reverse('mfa_authenticate'), {'code': f'{code:06d}'})
+        return client
+
+    @override_settings(TOM_MFA_REQUIRED='all')
+    def test_deactivate_page_offers_no_dead_button_when_disabling_is_forbidden(self):
+        client = self._enrol_and_log_in()
+        response = client.get(reverse('mfa_deactivate_totp'))
+        self.assertContains(response, 'contact the')
+        self.assertContains(response, 'Back to two-factor settings')
+        self.assertNotContains(response, 'Are you sure')
+        self.assertNotContains(response, '>Deactivate</button>', html=False)
+
+    def test_deactivate_page_confirms_normally_when_allowed(self):
+        client = self._enrol_and_log_in()
+        response = client.get(reverse('mfa_deactivate_totp'))
+        self.assertContains(response, 'Are you sure')
+        self.assertContains(response, 'Deactivate')
+
+    def test_wrong_current_password_says_so(self):
+        self.client.force_login(self.user)
+        response = self.client.post(reverse('account_change_password'), {
+            'oldpassword': 'not-my-password', 'password1': 'a-new-pass-2@x', 'password2': 'a-new-pass-2@x',
+        })
+        self.assertContains(response, 'That is not your current password')
+
+
+class TestRegistrationDiscoverability(TestCase):
+    """The Register button and the login-page invitation appear only while registration is open."""
+
+    def test_hidden_while_registration_is_closed(self):
+        home = self.client.get(reverse('home'))
+        self.assertNotContains(home, '>Register</a>')
+        login_page = self.client.get(reverse('account_login'))
+        self.assertNotContains(login_page, 'sign up')
+
+    @override_settings(TOM_REGISTRATION_STRATEGY='open')
+    def test_shown_while_registration_is_open(self):
+        home = self.client.get(reverse('home'))
+        self.assertContains(home, '>Register</a>')
+        self.assertContains(home, reverse('account_signup'))
+        login_page = self.client.get(reverse('account_login'))
+        self.assertContains(login_page, 'sign up')
+
+    @override_settings(TOM_REGISTRATION_STRATEGY='open')
+    def test_register_button_not_shown_to_authenticated_users(self):
+        user = User.objects.create_user(username='already_in', password='password')
+        self.client.force_login(user)
+        self.assertNotContains(self.client.get(reverse('home')), '>Register</a>')
+
+
+@override_settings(TOM_REGISTRATION_STRATEGY='approval_required')
+class TestApprovalWorkflow(TestCase):
+    """The administrator's side of approval_required: the Pending users table and approval."""
+
+    def setUp(self):
+        cache.clear()
+        self.superuser = User.objects.create_user(username='approver', password='password',
+                                                  is_staff=True, is_superuser=True)
+        self.pending = User.objects.create_user(username='applicant', password='applicant-pass-1!',
+                                                email='applicant@example.com', is_active=False)
+
+    def test_pending_table_shown_to_superusers_only(self):
+        self.client.force_login(self.superuser)
+        response = self.client.get(reverse('user-list'))
+        self.assertContains(response, 'Pending Users')
+        self.assertContains(response, 'applicant')
+        regular = User.objects.create_user(username='regular', password='password')
+        self.client.force_login(regular)
+        self.assertNotContains(self.client.get(reverse('user-list')), 'Pending Users')
+
+    def test_approval_activates_notifies_and_logs(self):
+        from django.core import mail
+        self.client.force_login(self.superuser)
+        with self.assertLogs('tom_common.security', 'INFO') as logs:
+            response = self.client.post(reverse('user-approve', kwargs={'pk': self.pending.pk}))
+        self.assertRedirects(response, reverse('user-list'), fetch_redirect_response=False)
+        self.pending.refresh_from_db()
+        self.assertTrue(self.pending.is_active)
+        self.assertEqual(mail.outbox[-1].to, ['applicant@example.com'])
+        self.assertIn('approved', mail.outbox[-1].subject)
+        self.assertIn('/accounts/login/', mail.outbox[-1].body)
+        self.assertIn('Registration approved: applicant by approver', '\n'.join(logs.output))
+        # the approved user can log in now
+        login = Client().post(reverse('login'),
+                              {'login': 'applicant', 'password': 'applicant-pass-1!'})
+        self.assertEqual(login.status_code, HTTPStatus.FOUND)
+
+    def test_approving_twice_is_a_404(self):
+        self.client.force_login(self.superuser)
+        self.client.post(reverse('user-approve', kwargs={'pk': self.pending.pk}))
+        response = self.client.post(reverse('user-approve', kwargs={'pk': self.pending.pk}))
+        self.assertEqual(response.status_code, HTTPStatus.NOT_FOUND)
+
+    def test_non_superusers_cannot_approve(self):
+        regular = User.objects.create_user(username='not_admin', password='password')
+        self.client.force_login(regular)
+        self.client.post(reverse('user-approve', kwargs={'pk': self.pending.pk}))
+        self.pending.refresh_from_db()
+        self.assertFalse(self.pending.is_active)
+
+
+class TestTomTokenAuthentication(TestCase):
+    """TomTokenAuthentication: expiry and MFA gating for API tokens."""
+
+    def setUp(self):
+        cache.clear()
+        self.user = User.objects.create_user(username='token_user', password='password')
+        self.token = Token.objects.get(user=self.user)  # auto-created by signal
+
+    def _api_get(self):
+        return self.client.get('/api/', HTTP_AUTHORIZATION=f'Token {self.token.key}')
+
+    def test_plain_token_works_with_nothing_configured(self):
+        self.assertEqual(self._api_get().status_code, HTTPStatus.OK)
+
+    @override_settings(TOM_API_TOKEN_EXPIRY_DAYS=60)
+    def test_expired_token_is_rejected_with_next_action(self):
+        self.assertEqual(self._api_get().status_code, HTTPStatus.OK)  # fresh token passes
+        Token.objects.filter(user=self.user).update(created=timezone.now() - timedelta(days=61))
+        response = self._api_get()
+        self.assertEqual(response.status_code, HTTPStatus.UNAUTHORIZED)
+        self.assertIn('Regenerate it on your profile edit page', response.json()['detail'])
+
+    @override_settings(TOM_API_TOKEN_REQUIRES_MFA=True)
+    def test_mfa_gating_lifecycle(self):
+        # not enrolled: rejected, message names the fix
+        response = self._api_get()
+        self.assertEqual(response.status_code, HTTPStatus.UNAUTHORIZED)
+        self.assertIn('two-factor', response.json()['detail'])
+        # enrolled, but the token predates enrolment: rejected
+        totp_auth.TOTP.activate(self.user, totp_auth.generate_totp_secret())
+        response = self._api_get()
+        self.assertEqual(response.status_code, HTTPStatus.UNAUTHORIZED)
+        self.assertIn('predates', response.json()['detail'])
+        # regenerated after enrolment: accepted
+        Token.objects.filter(user=self.user).delete()
+        self.token = Token.objects.create(user=self.user)
+        self.assertEqual(self._api_get().status_code, HTTPStatus.OK)
+        # turning MFA off invalidates the token immediately (no explicit revocation step)
+        Authenticator.objects.filter(user=self.user).delete()
+        self.assertEqual(self._api_get().status_code, HTTPStatus.UNAUTHORIZED)
+
+    @override_settings(TOM_API_TOKEN_REQUIRES_MFA=True, TOM_TERMS_OF_SERVICE_VERSION='v1')
+    def test_outstanding_requirement_rejects_the_token(self):
+        from tom_common.models import TermsOfServiceAcceptance
+        totp_auth.TOTP.activate(self.user, totp_auth.generate_totp_secret())
+        Token.objects.filter(user=self.user).delete()
+        self.token = Token.objects.create(user=self.user)
+        response = self._api_get()
+        self.assertEqual(response.status_code, HTTPStatus.UNAUTHORIZED)
+        self.assertIn('Terms accepted', response.json()['detail'])
+        TermsOfServiceAcceptance.objects.create(user=self.user, version='v1')
+        self.assertEqual(self._api_get().status_code, HTTPStatus.OK)
+
+    @override_settings(TOM_API_TOKEN_REQUIRES_MFA=True)
+    def test_system_check_warns_without_tom_token_authentication(self):
+        from tom_common.checks import api_token_settings_check
+        self.assertEqual(api_token_settings_check(None), [])  # settings.py lists our class
+        with override_settings(REST_FRAMEWORK={'DEFAULT_AUTHENTICATION_CLASSES': [
+                'rest_framework.authentication.TokenAuthentication']}):
+            warnings = api_token_settings_check(None)
+            self.assertEqual(len(warnings), 1)
+            self.assertEqual(warnings[0].id, 'tom_common.W001')
+
+
+class TestTokenEndpointAndRegeneration(TestCase):
+    """api/token-auth/ and token regeneration under TOM_API_TOKEN_REQUIRES_MFA."""
+
+    def setUp(self):
+        cache.clear()
+        self.user = User.objects.create_user(username='endpoint_user', password='password')
+
+    def test_token_auth_endpoint_works_by_default(self):
+        response = self.client.post('/api/token-auth/',
+                                    {'username': 'endpoint_user', 'password': 'password'})
+        self.assertEqual(response.status_code, HTTPStatus.OK)
+        self.assertIn('token', response.json())
+
+    @override_settings(TOM_API_TOKEN_REQUIRES_MFA=True)
+    def test_token_auth_endpoint_refuses_under_the_mfa_flag(self):
+        response = self.client.post('/api/token-auth/',
+                                    {'username': 'endpoint_user', 'password': 'password'})
+        self.assertEqual(response.status_code, HTTPStatus.FORBIDDEN)
+        self.assertIn('copy your token from your profile page', response.json()['detail'])
+
+    @override_settings(TOM_API_TOKEN_REQUIRES_MFA=True)
+    def test_superuser_cannot_regenerate_anothers_token_under_the_flag(self):
+        superuser = User.objects.create_user(username='endpoint_admin', password='password',
+                                             is_staff=True, is_superuser=True)
+        original_key = Token.objects.get(user=self.user).key
+        self.client.force_login(superuser)
+        response = self.client.post(reverse('regenerate-api-token', kwargs={'pk': self.user.pk}))
+        self.assertEqual(response.status_code, HTTPStatus.FOUND)
+        self.assertEqual(Token.objects.get(user=self.user).key, original_key)  # unchanged
+
+    @override_settings(TOM_API_TOKEN_REQUIRES_MFA=True)
+    def test_owner_regeneration_requires_recent_reauthentication(self):
+        original_key = Token.objects.get(user=self.user).key
+        # force_login leaves no allauth authentication record: sent to the reauthenticate page
+        self.client.force_login(self.user)
+        response = self.client.post(reverse('regenerate-api-token', kwargs={'pk': self.user.pk}))
+        self.assertEqual(response.status_code, HTTPStatus.FOUND)
+        self.assertIn(reverse('account_reauthenticate'), response.headers['Location'])
+        self.assertEqual(Token.objects.get(user=self.user).key, original_key)
+        # a real login is a recent authentication: regeneration proceeds
+        client = Client()
+        client.post(reverse('login'), {'login': 'endpoint_user', 'password': 'password'})
+        response = client.post(reverse('regenerate-api-token', kwargs={'pk': self.user.pk}))
+        self.assertEqual(response.status_code, HTTPStatus.FOUND)
+        self.assertNotEqual(Token.objects.get(user=self.user).key, original_key)
+
+    @override_settings(TOM_API_TOKEN_EXPIRY_DAYS=60)
+    def test_edit_page_shows_token_dates(self):
+        self.client.force_login(self.user)
+        response = self.client.get(reverse('user-update', kwargs={'pk': self.user.pk}))
+        self.assertContains(response, 'expires')
+
+
+class TestSecurityLog(TestCase):
+    """Authentication events emit one INFO line each on the tom_common.security logger."""
+
+    def setUp(self):
+        cache.clear()
+        self.user = User.objects.create_user(username='audit_user', password='password')
+
+    def test_login_success_failure_and_logout(self):
+        with self.assertLogs('tom_common.security', 'INFO') as logs:
+            self.client.post(reverse('login'), {'login': 'audit_user', 'password': 'wrong'})
+            self.client.post(reverse('login'), {'login': 'audit_user', 'password': 'password'})
+            self.client.post(reverse('logout'))
+        joined = '\n'.join(logs.output)
+        self.assertIn('Login failed: username=audit_user', joined)
+        self.assertIn('Login succeeded: audit_user', joined)
+        self.assertIn('Logout: audit_user', joined)
+        self.assertNotIn('wrong', joined)  # passwords are never logged
+
+    def test_mfa_enrollment_is_security_logged(self):
+        # a real login and enrolment: allauth emits authenticator_added from its view flow,
+        # not from the low-level TOTP.activate() used elsewhere in these tests
+        client = Client()
+        client.post(reverse('login'), {'login': 'audit_user', 'password': 'password'})  # login
+        with self.assertLogs('tom_common.security', 'INFO') as logs:
+            response = client.get(reverse('mfa_activate_totp'))  # get MFA enrollment form
+            secret = response.context['form'].secret
+            code = totp_auth.hotp_value(secret, int(time.time() // 30))
+            # django-allauth emits authenticator_added from transaction.on_commit,
+            # but a TestCase doesn't normally commit. execute=True causes the deferred
+            # on_commit callbacks to be executed, emitting the authenticator_added signal
+            # whose receiver logs the message we're asserting.
+            with self.captureOnCommitCallbacks(execute=True):
+                client.post(reverse('mfa_activate_totp'), {'code': f'{code:06d}'})  # complete enrollment
+        self.assertIn('Two-factor authenticator added: audit_user (totp)', '\n'.join(logs.output))
+
+    def test_password_change_is_security_logged(self):
+        with self.assertLogs('tom_common.security', 'INFO') as logs:
+            self.user.set_password('a-new-password-1!')
+            self.user.save()
+        self.assertIn('Password changed: audit_user', '\n'.join(logs.output))
+
+    @override_settings(TOM_TERMS_OF_SERVICE_VERSION='v1')
+    def test_terms_acceptance_and_token_regeneration(self):
+        self.client.force_login(self.user)
+        with self.assertLogs('tom_common.security', 'INFO') as logs:
+            self.client.post(reverse('terms-accept'))
+            self.client.post(reverse('regenerate-api-token', kwargs={'pk': self.user.pk}))
+        joined = '\n'.join(logs.output)
+        self.assertIn('Terms of service accepted: audit_user (version v1', joined)
+        self.assertIn('API token regenerated for audit_user by audit_user', joined)
+
+
+class TestRequiredFieldsOnUserForm(TestCase):
+    """TOM_REQUIRED_USER_FIELDS marks the listed User/Profile fields required on the edit form."""
+
+    def setUp(self):
+        cache.clear()
+        self.user = User.objects.create_user(username='form_user', password='password')
+        self.client.force_login(self.user)
+
+    def _post_update(self, **extra):
+        data = {
+            'profile-TOTAL_FORMS': '1', 'profile-INITIAL_FORMS': '1',
+            'profile-0-id': str(self.user.profile.pk), 'profile-0-user': str(self.user.pk),
+            'username': 'form_user', 'email': 'form@example.com',
+        }
+        data.update(extra)
+        return self.client.post(reverse('user-update', kwargs={'pk': self.user.pk}), data)
+
+    def test_fields_optional_by_default(self):
+        response = self._post_update()
+        self.assertEqual(response.status_code, HTTPStatus.FOUND)  # saved without the optional fields
+
+    @override_settings(TOM_REQUIRED_USER_FIELDS=['first_name', 'affiliation'])
+    def test_missing_required_fields_are_form_errors(self):
+        response = self._post_update()
+        self.assertEqual(response.status_code, HTTPStatus.OK)  # re-rendered with errors, not saved
+        self.assertContains(response, 'This field is required')
+
+    @override_settings(TOM_REQUIRED_USER_FIELDS=['first_name', 'affiliation'])
+    def test_filled_required_fields_save(self):
+        response = self._post_update(**{'first_name': 'Willa', 'profile-0-affiliation': 'LCO'})
+        self.assertEqual(response.status_code, HTTPStatus.FOUND)
+        self.user.refresh_from_db()
+        self.assertEqual(self.user.first_name, 'Willa')
+        self.assertEqual(self.user.profile.affiliation, 'LCO')
+
+
+class TestRequirementColumnsOnUserList(TestCase):
+    """Configured requirements appear as columns on the Users page; unconfigured ones do not."""
+
+    def setUp(self):
+        cache.clear()
+        self.superuser = User.objects.create_user(username='col_admin', password='password',
+                                                  is_staff=True, is_superuser=True)
+        self.user = User.objects.create_user(username='col_user', password='password')
+
+    def _user_list(self):
+        # requirements would redirect the (non-compliant) superuser away from the Users
+        # page; what is under test here is the columns, so satisfy or bypass as needed
+        self.client.force_login(self.superuser)
+        return self.client.get(reverse('user-list'))
+
+    def test_no_requirement_columns_by_default(self):
+        response = self._user_list()
+        self.assertNotContains(response, 'Terms accepted')
+        self.assertNotContains(response, 'Password current')
+
+    def test_guardian_anonymous_user_is_not_listed(self):
+        # guardian's permissions sentinel is not a person; requirements are inapplicable to it
+        response = self._user_list()
+        self.assertNotContains(response, 'AnonymousUser')
+
+    @override_settings(TOM_TERMS_OF_SERVICE_VERSION='v1')
+    def test_terms_column_reflects_acceptance_and_version_bumps(self):
+        from tom_common.models import TermsOfServiceAcceptance
+        TermsOfServiceAcceptance.objects.create(user=self.superuser, version='v1')
+        TermsOfServiceAcceptance.objects.create(user=self.user, version='v1')
+        response = self._user_list()
+        self.assertContains(response, 'Terms accepted')
+        self.assertNotContains(response, '<strong>no</strong>', html=True)
+        # bump the version: col_user has not accepted it and flips to no
+        with override_settings(TOM_TERMS_OF_SERVICE_VERSION='v2'):
+            TermsOfServiceAcceptance.objects.create(user=self.superuser, version='v2')  # readmit the admin
+            response = self._user_list()
+            self.assertContains(response, '<strong>no</strong>', count=1, html=True)
+
+    @override_settings(TOM_MFA_REQUIRED='superusers')
+    def test_mfa_requirement_column_respects_scoping(self):
+        totp_auth.TOTP.activate(self.superuser, totp_auth.generate_totp_secret())
+        response = self._user_list()
+        self.assertContains(response, '2FA required')
+        # the regular user is outside the policy: vacuously met, no 'no' rows
+        self.assertNotContains(response, '<strong>no</strong>', html=True)
+
+    @override_settings(TOM_PASSWORD_EXPIRY_DAYS=60)
+    def test_password_and_fields_columns_render(self):
+        Profile.objects.filter(user=self.superuser).update(password_changed_at=timezone.now())
+        response = self._user_list()
+        self.assertContains(response, 'Password current')
+        self.assertContains(response, '<strong>no</strong>', html=True)  # col_user's stamp is None
+
+
+class TestPasswordValidators(TestCase):
+    def test_character_class_validator(self):
+        from tom_common.accounts.password_validation import CharacterClassValidator
+        validator = CharacterClassValidator()
+        validator.validate('Abcdef1!')  # all four classes: no exception
+        for bad, missing in (('abcdef1!', 'upper-case'), ('ABCDEF1!', 'lower-case'),
+                             ('Abcdefg!', 'digit'), ('Abcdefg1', 'special')):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValidationError) as raised:
+                    validator.validate(bad)
+                self.assertIn(missing, str(raised.exception))
+
+    def test_not_same_as_current_password_validator(self):
+        from tom_common.accounts.password_validation import NotSameAsCurrentPasswordValidator
+        validator = NotSameAsCurrentPasswordValidator()
+        user = User.objects.create_user(username='validator_user', password='current-pass-1!')
+        with self.assertRaises(ValidationError):
+            validator.validate('current-pass-1!', user)
+        validator.validate('a-different-pass-2!', user)  # no exception
+        validator.validate('current-pass-1!', None)      # no user to compare: skipped
+        validator.validate('current-pass-1!', User(username='unsaved'))  # unsaved user: skipped
+
+    @override_settings(AUTH_PASSWORD_VALIDATORS=[
+        {'NAME': 'tom_common.accounts.password_validation.NotSameAsCurrentPasswordValidator'},
+    ])
+    def test_change_password_to_itself_is_rejected(self):
+        cache.clear()
+        User.objects.create_user(username='same_pass_user', password='current-pass-1!')
+        self.client.login(username='same_pass_user', password='current-pass-1!')
+        response = self.client.post(reverse('account_change_password'), {
+            'oldpassword': 'current-pass-1!',
+            'password1': 'current-pass-1!',
+            'password2': 'current-pass-1!',
+        })
+        self.assertContains(response, 'same as your current password')
+
+
+class TestAccountRequirements(TestCase):
+    """AccountRequirementsMiddleware + the built-in TOM_ACCOUNT_REQUIREMENTS checks."""
+
+    def setUp(self):
+        cache.clear()
+        self.user = User.objects.create_user(username='req_user', password='password')
+        self.client.force_login(self.user)
+
+    def test_all_checks_inactive_by_default(self):
+        self.assertEqual(self.client.get(reverse('user-profile')).status_code, HTTPStatus.OK)
+
+    @override_settings(TOM_MFA_REQUIRED='all')
+    def test_unenrolled_user_is_sent_to_enrolment(self):
+        response = self.client.get(reverse('user-profile'))
+        self.assertRedirects(response, with_next(reverse('mfa_activate_totp'), reverse('user-profile')),
+                             fetch_redirect_response=False)
+
+    @override_settings(TOM_MFA_REQUIRED='all')
+    def test_enrolment_page_and_logout_stay_reachable(self):
+        # a real login (not force_login) so allauth's reauthentication window is open
+        client = Client()
+        client.post(reverse('login'), {'login': 'req_user', 'password': 'password'})
+        self.assertEqual(client.get(reverse('mfa_activate_totp')).status_code, HTTPStatus.OK)
+        self.assertEqual(client.post(reverse('logout')).status_code, HTTPStatus.FOUND)
+
+    @override_settings(TOM_MFA_REQUIRED='all')
+    def test_enrolled_user_passes(self):
+        totp_auth.TOTP.activate(self.user, totp_auth.generate_totp_secret())
+        self.assertEqual(self.client.get(reverse('user-profile')).status_code, HTTPStatus.OK)
+
+    @override_settings(TOM_MFA_REQUIRED='superusers')
+    def test_superusers_scoping(self):
+        self.assertEqual(self.client.get(reverse('user-profile')).status_code, HTTPStatus.OK)
+        superuser = User.objects.create_user(username='req_super', password='password', is_superuser=True)
+        self.client.force_login(superuser)
+        response = self.client.get(reverse('user-profile'))
+        self.assertRedirects(response, with_next(reverse('mfa_activate_totp'), reverse('user-profile')),
+                             fetch_redirect_response=False)
+
+    @override_settings(TOM_PASSWORD_EXPIRY_DAYS=60)
+    def test_password_expiry(self):
+        # the new user's stamp is None: counts as expired
+        response = self.client.get(reverse('user-profile'))
+        self.assertRedirects(response, with_next(reverse('account_change_password'), reverse('user-profile')),
+                             fetch_redirect_response=False)
+        # a fresh stamp passes
+        Profile.objects.filter(user=self.user).update(password_changed_at=timezone.now())
+        self.assertEqual(self.client.get(reverse('user-profile')).status_code, HTTPStatus.OK)
+        # a stamp beyond the limit redirects again
+        Profile.objects.filter(user=self.user).update(
+            password_changed_at=timezone.now() - timedelta(days=61))
+        self.assertEqual(self.client.get(reverse('user-profile')).status_code, HTTPStatus.FOUND)
+
+    @override_settings(TOM_REQUIRED_USER_FIELDS=['first_name'])
+    def test_required_fields(self):
+        response = self.client.get(reverse('user-profile'))
+        self.assertRedirects(response,
+                             with_next(reverse('user-update', kwargs={'pk': self.user.pk}),
+                                       reverse('user-profile')),
+                             fetch_redirect_response=False)
+        User.objects.filter(pk=self.user.pk).update(first_name='Willa')
+        self.assertEqual(self.client.get(reverse('user-profile')).status_code, HTTPStatus.OK)
+
+    @override_settings(TOM_MFA_REQUIRED='all', TOM_PASSWORD_EXPIRY_DAYS=60)
+    def test_first_unmet_check_wins(self):
+        # both unmet; the default list runs mfa_enrolled before password_not_expired
+        response = self.client.get(reverse('user-profile'))
+        self.assertRedirects(response, with_next(reverse('mfa_activate_totp'), reverse('user-profile')),
+                             fetch_redirect_response=False)
+
+    @override_settings(TOM_MFA_REQUIRED='all')
+    def test_requirement_redirects_pass_through_the_htmx_redirect_middleware(self):
+        # protects middleware ordering: AccountRequirementsMiddleware must sit below
+        # HTMXRedirectMiddleware, or a blocked HTMX request swaps the redirect target
+        # into the requesting page fragment instead of navigating the whole window
+        response = self.client.get(reverse('user-profile'), HTTP_HX_REQUEST='true')
+        self.assertEqual(response.status_code, HTTPStatus.OK)
+        self.assertEqual(response.headers['HX-Redirect'],
+                         with_next(reverse('mfa_activate_totp'), reverse('user-profile')))
+
+    @override_settings(TOM_MFA_REQUIRED='all')
+    def test_anonymous_requests_are_untouched(self):
+        self.assertEqual(Client().get(reverse('account_login')).status_code, HTTPStatus.OK)
+
+
+class TestPasswordChangedStamp(TestCase):
+    """Profile.password_changed_at: dated only when the user chose the password themselves."""
+
+    def setUp(self):
+        cache.clear()
+        self.user = User.objects.create_user(username='stamp_user', password='old-password-123')
+
+    def _stamp(self):
+        self.user.profile.refresh_from_db()
+        return self.user.profile.password_changed_at
+
+    def test_self_service_change_stamps(self):
+        self.client.login(username='stamp_user', password='old-password-123')
+        response = self.client.post(reverse('account_change_password'), {
+            'oldpassword': 'old-password-123',
+            'password1': 'new-password-456',
+            'password2': 'new-password-456',
+        })
+        self.assertEqual(response.status_code, HTTPStatus.FOUND)
+        self.assertIsNotNone(self._stamp())
+
+    def test_own_profile_edit_password_change_stamps(self):
+        self.client.force_login(self.user)
+        self.client.post(reverse('user-update', kwargs={'pk': self.user.pk}), {
+            'profile-TOTAL_FORMS': '1', 'profile-INITIAL_FORMS': '1',
+            'profile-0-id': str(self.user.profile.pk), 'profile-0-user': str(self.user.pk),
+            'username': 'stamp_user', 'email': 'stamp@example.com',
+            'password1': 'new-password-456', 'password2': 'new-password-456',
+        })
+        self.assertIsNotNone(self._stamp())
+
+    def test_administrator_set_password_clears_the_stamp(self):
+        Profile.objects.filter(user=self.user).update(password_changed_at=timezone.now())
+        superuser = User.objects.create_user(username='stamp_admin', password='password',
+                                             is_staff=True, is_superuser=True)
+        self.client.force_login(superuser)
+        self.client.post(reverse('admin-user-change-password', kwargs={'pk': self.user.pk}),
+                         {'password': 'admin-chosen-789', 'change_password_form': '1'})
+        self.assertIsNone(self._stamp())
+
+    def test_login_does_not_touch_the_stamp(self):
+        stamp = timezone.now()
+        Profile.objects.filter(user=self.user).update(password_changed_at=stamp)
+        self.client.login(username='stamp_user', password='old-password-123')  # saves last_login
+        self.assertEqual(self._stamp(), stamp)
+
+
+class TestSecurityCardAndUserList(TestCase):
+    def setUp(self):
+        cache.clear()
+        self.user = User.objects.create_user(username='card_user', password='password')
+
+    def test_card_offers_enrolment_when_not_enrolled(self):
+        self.client.force_login(self.user)
+        response = self.client.get(reverse('user-profile'))
+        self.assertContains(response, 'Enable two-factor authentication')
+        self.assertContains(response, reverse('mfa_activate_totp'))
+
+    def test_card_links_management_when_enrolled(self):
+        totp_auth.TOTP.activate(self.user, totp_auth.generate_totp_secret())
+        self.client.force_login(self.user)
+        response = self.client.get(reverse('user-profile'))
+        self.assertContains(response, 'Manage two-factor authentication')
+        self.assertContains(response, reverse('mfa_index'))
+
+    @override_settings(TOM_MFA_REQUIRED='all')
+    def test_blocked_disable_names_the_next_action(self):
+        totp_auth.TOTP.activate(self.user, totp_auth.generate_totp_secret())
+        self.client.force_login(self.user)
+        response = self.client.get(reverse('user-profile'))
+        self.assertContains(response, 'contact the administrators')
+
+    def test_user_list_shows_two_factor_column(self):
+        totp_auth.TOTP.activate(self.user, totp_auth.generate_totp_secret())
+        superuser = User.objects.create_user(username='card_admin', password='password',
+                                             is_staff=True, is_superuser=True)
+        self.client.force_login(superuser)
+        response = self.client.get(reverse('user-list'))
+        self.assertContains(response, '<th>2FA</th>', html=True)
+
+    def test_email_addresses_shown_only_to_superusers(self):
+        User.objects.filter(username='card_user').update(email='private@example.com')
+        superuser = User.objects.create_user(username='card_admin', password='password',
+                                             is_staff=True, is_superuser=True)
+        self.client.force_login(superuser)
+        self.assertContains(self.client.get(reverse('user-list')), 'private@example.com')
+        self.client.force_login(self.user)
+        response = self.client.get(reverse('user-list'))
+        self.assertNotContains(response, 'private@example.com')
+        self.assertNotContains(response, '<th>Email</th>', html=True)
+
+
+class TestHTMXRedirectMiddleware(TestCase):
+    def test_redirects_on_htmx_requests_become_full_page_navigations(self):
+        # an anonymous HTMX request to a login-protected page: without the middleware, htmx
+        # would swap the login page into the requesting fragment
+        response = self.client.get(reverse('user-profile'), HTTP_HX_REQUEST='true')
+        self.assertEqual(response.status_code, HTTPStatus.OK)
+        self.assertIn(reverse('account_login'), response.headers['HX-Redirect'])
+
+    def test_redirects_on_ordinary_requests_are_unchanged(self):
+        response = self.client.get(reverse('user-profile'))
+        self.assertEqual(response.status_code, HTTPStatus.FOUND)
+        self.assertNotIn('HX-Redirect', response.headers)
+
+
+class TestPasswordResetOptIn(TestCase):
+    """TOM_PASSWORD_RESET_ENABLED=False (the default) leaves the reset routes unmounted."""
+
+    @staticmethod
+    def _reload_urlconf():
+        """Rebuild the URLconf so a changed TOM_PASSWORD_RESET_ENABLED takes effect."""
+        import importlib
+
+        import tom_common.urls
+        importlib.reload(tom_common.urls)
+        clear_url_caches()
+
+    def test_reset_routes_not_mounted_by_default(self):
+        with self.assertRaises(NoReverseMatch):
+            reverse('account_reset_password')
+        self.assertEqual(self.client.get('/accounts/password/reset/').status_code, HTTPStatus.NOT_FOUND)
+
+    def test_login_page_has_no_reset_link_by_default(self):
+        response = self.client.get(reverse('account_login'))
+        self.assertNotContains(response, 'Forgot your password')
+
+    def test_reset_routes_and_login_link_appear_when_enabled(self):
+        self.addCleanup(self._reload_urlconf)  # runs after the override exits: back to unmounted
+        with override_settings(TOM_PASSWORD_RESET_ENABLED=True):
+            self._reload_urlconf()
+            self.assertEqual(self.client.get('/accounts/password/reset/').status_code, HTTPStatus.OK)
+            self.assertContains(self.client.get('/accounts/login/'), 'Forgot your password')
+
+    def test_reset_pages_open_on_locked_toms_when_enabled(self):
+        self.addCleanup(self._reload_urlconf)
+        with override_settings(TOM_PASSWORD_RESET_ENABLED=True, AUTH_STRATEGY='LOCKED', OPEN_URLS=[]):
+            self._reload_urlconf()
+            for path in ('/accounts/password/reset/',
+                         '/accounts/password/reset/key/abc-def/'):  # parametrized: no wildcard needed
+                with self.subTest(path=path):
+                    self.assertEqual(self.client.get(path).status_code, HTTPStatus.OK)
+
+
+@override_settings(AUTH_STRATEGY='LOCKED', OPEN_URLS=[])
+class TestLockedAllauthExemptions(TestCase):
+    """Anonymous users on a LOCKED TOM can reach every page of the login flow — and nothing else."""
+
+    def test_authentication_pages_are_open(self):
+        # the password-reset pages join this list when TOM_PASSWORD_RESET_ENABLED mounts them
+        # (covered in TestPasswordResetOptIn)
+        for path in (
+            reverse('account_login'),
+            reverse('account_signup'),
+            reverse('account_inactive'),
+        ):
+            with self.subTest(path=path):
+                self.assertEqual(self.client.get(path).status_code, HTTPStatus.OK)
+
+    def test_full_two_factor_login_works_when_locked(self):
+        cache.clear()
+        user = User.objects.create_user(username='locked_mfa_user', password='password')
+        secret = totp_auth.generate_totp_secret()
+        totp_auth.TOTP.activate(user, secret)
+        response = self.client.post(reverse('login'), {'login': 'locked_mfa_user', 'password': 'password'})
+        self.assertRedirects(response, reverse('mfa_authenticate'), fetch_redirect_response=False)
+        self.assertEqual(self.client.get(reverse('mfa_authenticate')).status_code, HTTPStatus.OK)
+        code = totp_auth.hotp_value(secret, int(time.time() // 30))
+        self.client.post(reverse('mfa_authenticate'), {'code': f'{code:06d}'})
+        self.assertEqual(self.client.get(reverse('tom_targets:list')).status_code, HTTPStatus.OK)
+
+    def test_other_pages_stay_locked(self):
+        response = self.client.get(reverse('tom_targets:list'))
+        # Raise403Middleware turns the middleware's 403 into a redirect to the login page
+        self.assertEqual(response.status_code, HTTPStatus.FOUND)
+        self.assertIn(reverse('account_login'), response.headers['Location'])
+
+
+class TestTomMFAAdapter(TestCase):
+    def setUp(self):
+        self.user = User.objects.create_user(username='mfa_user', password='password')
+        cache.clear()  # allauth login rate limits are cache-counted
+
+    def test_totp_secret_is_stored_encrypted(self):
+        secret = totp_auth.generate_totp_secret()
+        totp_auth.TOTP.activate(self.user, secret)
+        stored = Authenticator.objects.get(user=self.user, type=Authenticator.Type.TOTP).data['secret']
+        self.assertNotEqual(stored, secret)
+        self.assertEqual(get_mfa_adapter().decrypt(stored), secret)
+
+    def test_totp_issuer_is_tom_name(self):
+        with override_settings(TOM_NAME='My Fine TOM'):
+            self.assertEqual(get_mfa_adapter().get_totp_issuer(), 'My Fine TOM')
+
+    def test_enrollment_qr_svg_has_a_white_background(self):
+        """The QR must be scannable on the dark theme and a white background ensures this.
+
+        The django-allauth default is transparent background which makes the black QR code
+        "modules" invisible against a black background. We override that default and this
+        test tests our override.
+
+        The test reads the rendered enrolment page and decodes the QR image it embeds.
+        So, this also verifies the adapter override is the one the page actually uses.
+        """
+        self.client.post(reverse('login'), {'login': 'mfa_user', 'password': 'password'})
+        response = self.client.get(reverse('mfa_activate_totp'))
+        match = re.search(r'src="data:image/svg\+xml;base64,([^"]+)"', response.content.decode())
+        self.assertIsNotNone(match, 'no inline SVG QR image on the enrolment page')
+        svg = base64.b64decode(match.group(1)).decode('utf8')
+        self.assertIn('<rect fill="white"', svg)
+
+    def test_can_delete_authenticator_follows_tom_mfa_required(self):
+        superuser = User.objects.create_user(username='mfa_super', password='password', is_superuser=True)
+        user_authenticator = Authenticator(user=self.user, type=Authenticator.Type.TOTP, data={})
+        superuser_authenticator = Authenticator(user=superuser, type=Authenticator.Type.TOTP, data={})
+        adapter = get_mfa_adapter()
+        self.assertTrue(adapter.can_delete_authenticator(user_authenticator))  # TOM_MFA_REQUIRED unset
+        with override_settings(TOM_MFA_REQUIRED='superusers'):
+            self.assertTrue(adapter.can_delete_authenticator(user_authenticator))
+            self.assertFalse(adapter.can_delete_authenticator(superuser_authenticator))
+        with override_settings(TOM_MFA_REQUIRED='all'):
+            self.assertFalse(adapter.can_delete_authenticator(user_authenticator))
+
+
+class TestAllauthTemplates(TestCase):
+    """The allauth pages render inside the TOM's base template with Bootstrap 5 styling."""
+
+    def setUp(self):
+        cache.clear()  # allauth login rate limits are cache-counted
+        self.user = User.objects.create_user(username='template_user', password='template-pass')
+
+    def test_anonymous_pages_render_in_tom_base_template(self):
+        for url_name in ('account_login', 'account_signup'):
+            with self.subTest(url_name=url_name):
+                response = self.client.get(reverse(url_name))
+                self.assertEqual(response.status_code, HTTPStatus.OK)
+                self.assertContains(response, 'navbar-brand')  # the navbar from tom_common/base.html
+
+    def test_signup_closed_page_suggests_next_action(self):
+        # blocking messages must point at the unblocking action, not just state the block
+        response = self.client.get(reverse('account_signup'))
+        self.assertContains(response, 'contact the administrators')
+
+    def test_login_form_is_bootstrap_styled(self):
+        response = self.client.get(reverse('account_login'))
+        self.assertContains(response, 'form-control')
+        self.assertContains(response, 'btn btn-primary')
+        self.assertNotContains(response, 'Menu:')  # allauth's unstyled default layout
+
+    def test_allauth_page_scripts_survive_the_layout_bridge(self):
+        """allauth pages ship page scripts via extra_body; the layout must render that block.
+
+        The observable symptom of losing it: the recovery-codes "I have saved my recovery
+        codes" checkbox does nothing (its leave-warning script never loads).
+        """
+        from allauth.mfa.recovery_codes.internal.auth import RecoveryCodes
+        user = User.objects.create_user(username='script_user', password='script-pass-1!')
+        totp_auth.TOTP.activate(user, totp_auth.generate_totp_secret())
+        RecoveryCodes.activate(user)
+        client = Client()
+        client.post(reverse('login'), {'login': 'script_user', 'password': 'script-pass-1!'})
+        secret = get_mfa_adapter().decrypt(
+            Authenticator.objects.get(user=user, type=Authenticator.Type.TOTP).data['secret'])
+        code = totp_auth.hotp_value(secret, int(time.time() // 30))
+        client.post(reverse('mfa_authenticate'), {'code': f'{code:06d}'})
+        # a TOM that opts into show-once gets allauth's stock save-confirmation checkbox — and it
+        # must work, which is exactly what this layout-bridge test protects. This branch runs
+        # first: any view of the codes marks them viewed, and show-once shows only unviewed codes.
+        with override_settings(MFA_RECOVERY_CODES_SHOW_ONCE=True):
+            response = client.get(reverse('mfa_view_recovery_codes'))
+            self.assertContains(response, 'id="codes_saved"')
+            self.assertContains(response, 'mfa/js/recovery_codes.js')
+        response = client.get(reverse('mfa_view_recovery_codes'))
+        self.assertContains(response, 'mfa/js/recovery_codes.js')  # allauth's stock page script
+        self.assertContains(response, 'Download codes')  # codes stay downloadable (SHOW_ONCE off)
+        self.assertContains(response, 'id="back_button"')  # a way off the page (our one divergence)
+        self.assertNotContains(response, 'id="codes_saved"')  # the save-confirmation checkbox is SHOW_ONCE-only
+
+    def test_challenge_page_override_present(self):
+        """Test that our override (specified by `default_settings.MFA_FORMS`) delivers
+        our custom fields.
+        """
+        user = User.objects.create_user(username='challenged_user', password='challenge-pass-1!')
+        totp_auth.TOTP.activate(user, totp_auth.generate_totp_secret())
+        client = Client()
+        client.post(reverse('login'), {'login': 'challenged_user', 'password': 'challenge-pass-1!'})
+        response = client.get(reverse('mfa_authenticate'))
+        self.assertContains(response, 'Authenticator or recovery code')  # label field
+        self.assertContains(response, 'contact the administrators of this TOM')  # help_text field
+
+    def test_two_factor_overview_renders_as_cards(self):
+        self.client.force_login(self.user)
+        response = self.client.get(reverse('mfa_index'))
+        self.assertEqual(response.status_code, HTTPStatus.OK)
+        self.assertContains(response, 'navbar-brand')  # the navbar from tom_common/base.html
+        self.assertContains(response, 'card-body')
+
+
+class TestRotateEncryptionKeyAuthenticators(TestCase):
+    def test_rotate_reencrypts_totp_secret(self):
+        user = User.objects.create_user(username='rotate_mfa_user', password='password')
+        with override_settings(SECRET_KEY='old-key'):
+            secret = totp_auth.generate_totp_secret()
+            totp_auth.TOTP.activate(user, secret)
+        with override_settings(SECRET_KEY='new-key', SECRET_KEY_FALLBACKS=['old-key']):
+            call_command('rotate_encryption_key', stdout=StringIO())
+        # after rotation the fallback is no longer needed
+        with override_settings(SECRET_KEY='new-key', SECRET_KEY_FALLBACKS=[]):
+            stored = Authenticator.objects.get(user=user).data['secret']
+            self.assertEqual(get_mfa_adapter().decrypt(stored), secret)
+
+
 class CommentDeleteViewTest(TestCase):
     def setUp(self):
         self.site = Site.objects.get_current()
@@ -440,284 +1665,461 @@ class TestRobotsDotTxt(TestCase):
             assert response.content.startswith(b"User-Agent: *\n")  # known a priori from default robots.txt
 
 
-class TestUserSession(TestCase):
-    """Test that a UserSession instance is created when a user logs in.
-    """
-    def setUp(self):
-        # Create a user and log them in.
-        username = 'testuser'
-        password = 'testpassword'  # noqa
-        self.user = User.objects.create_user(username=username, password=password)
-        # don't user client.force_login() here, because it matters how the user logs in
-        self.client.login(username=username, password=password)
-
-    def test_user_session_created(self):
-        """The UserSession links the User to the User's SessionStore instance.
-
-        Here we just test that the UserSession instance is created when the user logs in.
-        The UserSession instance is created in the `user_logged_in` signal receiver,
-        `tom_common.signals.create_user_session_on_login`
-        """
-        # Check that a UserSession instance is created for the logged-in user.
-        user_sessions: QuerySet = UserSession.objects.filter(user=self.user)
-        self.assertEqual(user_sessions.count(), 1)  # make sure there's only one
-
-        user_session = user_sessions.first()
-        self.assertIsInstance(user_session, UserSession)  # check that it's a UserSession instance
-        self.assertEqual(user_session.user, self.user)    # that links to the correct User
-
-    def test_user_session_deleted(self):
-        # Check that the UserSession instance is deleted when the user logs out.
-        self.client.logout()
-        user_sessions: QuerySet = UserSession.objects.filter(user=self.user)
-        self.assertEqual(user_sessions.count(), 0)  # there should be none left
-
-    def test_user_session_properties(self):
-        user_sessions: QuerySet = UserSession.objects.filter(user=self.user)
-        self.assertEqual(user_sessions.count(), 1)  # make sure there's only one
-
-        user_session: UserSession = user_sessions.first()
-
-        session: Session = user_session.session
-        self.assertIsInstance(session, Session)  # make sure it's a Session instance
-
-
-class TestEncryptionKeyManagement(TestCase):
-    def setUp(self):
-        # Create a user and log in.
-        username = 'testuser'
-        password = 'testpassword'
-        self.user = User.objects.create_user(username=username, password=password)
-        self.plaintext = f'this is a plaintext test message on {datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")}'
-
-        # Don't use client.login() here, because we need the request to go through the middleware
-        # in order to create a SessionStore instance. So, this doesn't work:
-        # self.client.login(username=username, password=password)  # NOPE
-
-        # Instead, we use the client.post() method to log in, which will create a SessionStore instance
-        # as the User is logged in. (it returns an HTTPResponse object, but we don't need it)
-        _ = self.client.post("/accounts/login/", {"username": username, "password": password})
-
-    def test_encryption_key_extraction(self):
-        """The UserSession.session field is a ForeignKey to the the Session model.
-        So, `user_session.session` should be an instance of the Session model. This is the
-        dictionary-like object saved in the SessionStore. We use it to hold the User's
-        encryption key.
-
-        This test checks that after setUp, where we create a user and log them in:
-        1. the UserSession instance is created and that there's only one
-        2. the encryption key can be extracted from the session store.
-        3. the encryption key is a bytes object that can be used to create a Fernet cipher
-        4. the Fernet cipher can be used to encrypt and decrypt a plaintext message.
-        """
-        user_sessions: QuerySet = UserSession.objects.filter(user=self.user)
-        self.assertEqual(user_sessions.count(), 1)  # make sure there's only one
-
-        user_session: UserSession = user_sessions.first()
-        session: Session = user_session.session
-
-        # extract the encryption key from the session store
-        encryption_key: bytes = get_key_from_session_model(session)
-        self.assertIsInstance(encryption_key, bytes)  # check that it's a bytes object
-        cipher = Fernet(encryption_key)  # and we can use it to create a Fernet cipher
-
-        # make sure the cipher works (i.e. the key is not weird).
-        ciphertext = cipher.encrypt(self.plaintext.encode())
-        decoded_ciphertext = cipher.decrypt(ciphertext).decode()
-        self.assertEqual(self.plaintext, decoded_ciphertext)
-
-    def test_encryption_key_extraction_from_session_store(self):
-        """Test that get_key_from_session_store() and get_key_from_session_model()
-        return the same key.
-
-        Use get_key_from_session_store() when you have a SessionStore instance,
-        probably from a decorated HTTPRequest. Use get_key_from_session_model()
-        only have a UserSession instance.
-        """
-        # Get the UserSession instance for the logged-in user.
-        user_sessions: QuerySet = UserSession.objects.filter(user=self.user)
-        self.assertEqual(user_sessions.count(), 1)  # make sure there's only one in the QuerySet
-        user_session: UserSession = user_sessions.first()
-        session: Session = user_session.session
-        self.assertIsInstance(session, Session)  # make sure it's a Session instance
-
-        # To demonstrate the difference between Session and SessionStore:
-        # Get the key from the Session model instance
-        key_from_session: bytes = get_key_from_session_model(session)
-        self.assertIsInstance(key_from_session, bytes)
-
-        # Create a SessionStore...
-        from django.contrib.sessions.backends.db import SessionStore
-        # (the session has a session_key we can use to create a SessionStore instance)
-        session_store = SessionStore(session_key=session.session_key)
-        # ...and get the key from it
-        key_from_session_store: bytes = get_key_from_session_store(session_store)
-        self.assertEqual(key_from_session, key_from_session_store)  # check that they are the same
-
-    def test_encryption_key_update_upon_password_change(self):
-        """Test that the encryption key is updated when the user changes their password.
-
-        The basic structure of this test is to:
-        1. log in and make sure the UserSession, SessionStore, encryption_key, etc is working.
-        2. change the user's password
-        3. log out and back in again with the new password
-        4. check that the encryption key in the new session store has changed
-
-        Along the way, we check that the encryption keys (old and new) work and
-        a cipher created with them can be used to encrypt and decrypt a plaintext
-        message.
-
-        This test does not test the re-encryption of the model fields up on
-        a password change.
-        """
-        # Get the UserSession instance for the logged-in user.
-        user_sessions: QuerySet = UserSession.objects.filter(user=self.user)
-        self.assertEqual(user_sessions.count(), 1)
-        user_session: UserSession = user_sessions.first()
-        session: Session = user_session.session
-        self.assertIsInstance(session, Session)  # make sure it's a Session instance
-
-        # Get the key from the Session model instance
-        encryption_key: bytes = get_key_from_session_model(session)
-        self.assertIsInstance(encryption_key, bytes)
-
-        cipher = Fernet(encryption_key)
-
-        # Encrypt the plaintext message with the current key.
-        ciphertext = cipher.encrypt(self.plaintext.encode())
-        decoded_ciphertext = cipher.decrypt(ciphertext).decode()
-        self.assertEqual(self.plaintext, decoded_ciphertext)  # check that the key works
-
-        # Change the user's password.
-        new_password = 'newpassword'  # noqa
-        self.user.set_password(new_password)
-        self.user.save()  # triggers pre_save signal on User model
-
-        # check that the password was changed
-        self.assertFalse(self.user.check_password('testpassword'))
-        self.assertTrue(self.user.check_password(new_password))
-
-        # Log out and back in again to create a new session
-        self.client.post("/accounts/logout/")
-        response = self.client.post("/accounts/login/",
-                                    {"username": self.user.username, "password": new_password})
-        logger.debug(f'login response: {response}')
-
-        # Get the new UserSession instance for the logged-in user.
-        user_sessions: QuerySet = UserSession.objects.filter(user=self.user)
-        self.assertEqual(user_sessions.count(), 1)
-        user_session: UserSession = user_sessions.first()
-        session: Session = user_session.session
-
-        # Extract the new encryption key from the session store.
-        new_encryption_key: bytes = get_key_from_session_model(session)
-        self.assertIsInstance(new_encryption_key, bytes)
-
-        # The new encryption key should be different from the old one.
-        self.assertNotEqual(new_encryption_key, encryption_key)
-
-        # Encrypt the plaintext message with the new key.
-        cipher = Fernet(new_encryption_key)
-        ciphertext = cipher.encrypt(self.plaintext.encode())
-        decoded_ciphertext = cipher.decrypt(ciphertext).decode()
-
-        # Check that the new key works.
-        self.assertEqual(self.plaintext, decoded_ciphertext)
-
-
 class TestSignalHandlers(TestCase):
+    """Tests for signal handlers in signals.py."""
+
     def setUp(self):
-        self.username = 'signaltestuser'
-        self.password = 'signaltestpass'
-        self.user = User.objects.create_user(username=self.username, password=self.password, email='signal@example.com')
+        self.user = User.objects.create_user(
+            username='signaltestuser', password='signaltestpass',
+            email='signal@example.com',
+        )
 
-    def test_create_user_session_on_user_logged_in(self):
-        # Initially, no UserSession for this user
-        self.assertFalse(UserSession.objects.filter(user=self.user).exists())
-        # Log in the user
-        self.client.login(username=self.username, password=self.password)
-        # Check UserSession is created
-        self.assertTrue(UserSession.objects.filter(user=self.user).exists())
-        user_session = UserSession.objects.get(user=self.user)
-        self.assertIsNotNone(user_session.session)
+    def test_profile_created_on_user_creation(self):
+        """The post_save signal should create a Profile when a User is created."""
+        self.assertTrue(Profile.objects.filter(user=self.user).exists())
 
-    def test_delete_user_session_on_user_logged_out(self):
-        # Log in the user to create a session
-        self.client.login(username=self.username, password=self.password)
-        self.assertTrue(UserSession.objects.filter(user=self.user).exists())
-        session_key = self.client.session.session_key
-        self.assertTrue(Session.objects.filter(session_key=session_key).exists())
+    def test_drf_token_created_on_user_creation(self):
+        """The post_save signal should create a DRF auth token for new users."""
+        from rest_framework.authtoken.models import Token
+        self.assertTrue(Token.objects.filter(user=self.user).exists())
 
-        # Log out the user
-        self.client.logout()
+    def test_user_save_does_not_clobber_concurrent_profile_changes(self):
+        """Regression guard: saving a User must NOT write back a stale cached
+        Profile, clobbering out-of-band updates.
 
-        # Check UserSession is deleted
-        self.assertFalse(UserSession.objects.filter(user=self.user).exists())
-        # Check the associated Session is also deleted
-        self.assertFalse(Session.objects.filter(session_key=session_key).exists())
+        The risk: ``update_last_login`` fires the post_save signal on every
+        login. If the signal unconditionally re-saved ``instance.profile``,
+        the cached Profile (a snapshot from earlier in this Python process)
+        would overwrite any concurrent updates made via a separate queryset.
+        """
+        # Modify the Profile out-of-band (no in-memory link to self.user).
+        Profile.objects.filter(user=self.user).update(affiliation='LCO')
 
-    def test_set_cipher_on_user_logged_in(self):
-        # Log in the user using client.post to simulate form submission with password
-        self.client.post(reverse('login'), {'username': self.username, 'password': self.password})
+        # Force a User save that triggers the signal (mimics what
+        # ``update_last_login`` does on every login).
+        self.user.save(update_fields=['last_login'])
 
-        # Check that the encryption key is in the session
-        self.assertIn(SESSION_KEY_FOR_CIPHER_ENCRYPTION_KEY, self.client.session)
-        key_from_session_store = self.client.session[SESSION_KEY_FOR_CIPHER_ENCRYPTION_KEY]
-        self.assertIsInstance(key_from_session_store, str)
-        self.assertIsNotNone(key_from_session_store)
+        # The out-of-band change must survive the signal's pass.
+        self.assertEqual(Profile.objects.get(user=self.user).affiliation, 'LCO')
 
-        # Verify the key can be used
-        try:
-            retrieved_fernet_key = get_key_from_session_store(self.client.session)
 
-            # retrieved_fernet_key should now be the original Fernet key and usable by Fernet.
-            Fernet(retrieved_fernet_key)  # This should not raise an error if the key is valid
-        except Exception as e:
-            self.fail(f"Encryption key from session is not a valid Fernet key: {e}")
+# ---------------------------------------------------------------------------
+# Encryption: HKDF derivation, descriptor round-trip, fallback decryption,
+# and the rotate_encryption_key management command.
+# ---------------------------------------------------------------------------
 
-    def test_set_cipher_on_user_logged_in_no_password_in_request(self):
-        # Simulate a login scenario where request.POST does not contain 'password'
-        # This can happen with force_login or other custom auth backends
-        # We expect an error to be logged, but the login should still proceed.
-        # The key won't be set in the session by this specific signal handler.
+class TestDerivedCipher(TestCase):
+    """Tests for the HKDF derivation of the Fernet cipher from SECRET_KEY.
 
-        # Use force_login which doesn't populate request.POST['password']
-        self.client.force_login(self.user)
+    These verify the load-bearing invariants of the simplified encryption
+    scheme: derivation is deterministic for a given SECRET_KEY, distinct
+    SECRET_KEYs produce distinct ciphers, and encrypt+decrypt round-trips.
+    """
 
-        # Check that the encryption key is NOT in the session from this signal
-        # (it might be set by other mechanisms, but not by set_cipher_on_user_logged_in)
-        # We can't directly assert it's not there if other parts of the login process add it.
-        # Instead, we check that our logger.error was called.
-        with self.assertLogs('tom_common.signals', level='ERROR') as cm:
-            # Manually trigger the signal with a mock request that has no POST data
-            from django.contrib.auth.signals import user_logged_in
-            mock_request = MagicMock()
-            mock_request.POST = {}  # No password
-            mock_request.session = self.client.session  # Use the actual session object
-            user_logged_in.send(sender=self.user.__class__, request=mock_request, user=self.user)
-        self.assertIn(f'User {self.username} logged in without a password. Cannot create encryption key.', cm.output[0])
-        # Key should not be in session from *this* signal call
-        self.assertNotIn(SESSION_KEY_FOR_CIPHER_ENCRYPTION_KEY, mock_request.session)
+    def test_derivation_is_deterministic(self):
+        self.assertEqual(
+            encryption._derive_fernet_key('alpha'),
+            encryption._derive_fernet_key('alpha'),
+        )
 
-    def test_clear_encryption_key_on_user_logged_out(self):
-        # Log in and ensure key is set
-        self.client.post(reverse('login'), {'username': self.username, 'password': self.password})
-        self.assertIn(SESSION_KEY_FOR_CIPHER_ENCRYPTION_KEY, self.client.session)
+    def test_derivation_changes_with_secret_key(self):
+        self.assertNotEqual(
+            encryption._derive_fernet_key('alpha'),
+            encryption._derive_fernet_key('beta'),
+        )
 
-        # Log out
-        self.client.logout()
+    @override_settings(SECRET_KEY='roundtrip-secret-key-value')
+    def test_encrypt_decrypt_roundtrip(self):
+        plaintext = 'a perfectly innocent observatory password'
+        blob = encryption.encrypt(plaintext)
+        self.assertIsInstance(blob, bytes)
+        self.assertNotIn(plaintext.encode(), blob)  # bytes really are ciphertext
+        self.assertEqual(encryption.decrypt(blob), plaintext)
 
-        # Check that the encryption key is removed from the session
-        self.assertNotIn(SESSION_KEY_FOR_CIPHER_ENCRYPTION_KEY, self.client.session)
 
-    @patch('tom_common.signals.session_utils.reencrypt_data')
-    def test_user_updated_on_user_pre_save_password_changed(self, mock_reencrypt):
-        self.user.set_password('newpassword123')
-        self.user.save()  # Triggers pre_save signal
-        mock_reencrypt.assert_called_once_with(self.user)
+class TestEncryptedModelFieldRoundTrip(TestCase):
+    """Unit tests for EncryptedModelField's per-method behavior.
 
-    @patch('tom_common.signals.session_utils.reencrypt_data')
-    def test_user_updated_on_user_pre_save_password_not_changed(self, mock_reencrypt):
-        self.user.first_name = 'Signal'
-        self.user.save()  # Triggers pre_save signal
-        mock_reencrypt.assert_not_called()
+    Exercises the field's pure methods (``from_db_value``, ``to_python``,
+    ``get_prep_value``, ``value_from_object``, ``value_to_string``,
+    ``get_lookup``, ``formfield``) without a live database. Full
+    ModelForm + ORM integration — including the blank-submission
+    preservation mechanism — is exercised against a real model in the
+    demo app's test suite.
+
+    Field instances are built via ``set_attributes_from_name`` to
+    populate ``.name`` and ``.attname``, mirroring what Django does
+    during ``contribute_to_class`` on a real model declaration.
+    """
+
+    def _build_field(self, name: str = 'secret') -> EncryptedModelField:
+        field = EncryptedModelField(null=True, blank=True)
+        field.set_attributes_from_name(name)
+        return field
+
+    @override_settings(SECRET_KEY='emf-roundtrip')
+    def test_get_prep_value_then_from_db_value_yields_original_plaintext(self):
+        field = self._build_field()
+        ciphertext = field.get_prep_value('shh-secret-value')
+        self.assertIsInstance(ciphertext, bytes)
+        self.assertNotIn(b'shh-secret-value', ciphertext)
+        plaintext = field.from_db_value(ciphertext, None, None)
+        self.assertEqual(plaintext, 'shh-secret-value')
+
+    @override_settings(SECRET_KEY='emf-memoryview')
+    def test_from_db_value_normalises_memoryview_to_bytes(self):
+        # psycopg returns memoryview rather than bytes for binary columns;
+        # SQLite returns bytes. The field must handle both transparently.
+        field = self._build_field()
+        ciphertext = field.get_prep_value('postgres-style-secret')
+        plaintext = field.from_db_value(memoryview(ciphertext), None, None)
+        self.assertEqual(plaintext, 'postgres-style-secret')
+
+    def test_from_db_value_none_returns_none(self):
+        field = self._build_field()
+        self.assertIsNone(field.from_db_value(None, None, None))
+
+    def test_get_prep_value_treats_none_and_empty_string_as_no_value(self):
+        # Both store as NULL — avoids producing an encrypted empty-string
+        # row when a caller writes ``instance.api_key = ''``.
+        field = self._build_field()
+        self.assertIsNone(field.get_prep_value(None))
+        self.assertIsNone(field.get_prep_value(''))
+
+    @override_settings(SECRET_KEY='emf-to-python-str')
+    def test_to_python_passes_plaintext_str_through(self):
+        field = self._build_field()
+        self.assertEqual(field.to_python('plaintext'), 'plaintext')
+        self.assertIsNone(field.to_python(None))
+
+    @override_settings(SECRET_KEY='emf-to-python-bytes')
+    def test_to_python_decrypts_bytes(self):
+        # Fixture deserialization can pass bytes to to_python.
+        field = self._build_field()
+        ciphertext = field.get_prep_value('decrypt-me')
+        self.assertEqual(field.to_python(ciphertext), 'decrypt-me')
+
+    def test_to_python_refuses_redacted_placeholder(self):
+        # dumpdata round-trip protection: loading the placeholder back
+        # would silently encrypt the literal placeholder string as the
+        # new "secret". Raise instead.
+        field = self._build_field()
+        with self.assertRaises(ValidationError):
+            field.to_python(field.REDACTED)
+
+    def test_get_lookup_raises_field_error_for_any_lookup(self):
+        # Fernet ciphertext cannot match a plaintext query under any
+        # lookup. Refuse early and explicitly.
+        field = self._build_field()
+        with self.assertRaises(FieldError):
+            field.get_lookup('exact')
+        with self.assertRaises(FieldError):
+            field.get_lookup('icontains')
+
+    def test_value_from_object_returns_redacted_placeholder_when_value_set(self):
+        # Redaction in serialization: DRF ModelSerializer and admin
+        # display introspection must not see the plaintext.
+        field = self._build_field()
+        obj = SimpleNamespace()
+        obj.__dict__[field.attname] = 'real-plaintext'
+        self.assertEqual(field.value_from_object(obj), field.REDACTED)
+
+    def test_value_from_object_returns_none_when_value_unset(self):
+        field = self._build_field()
+        obj = SimpleNamespace()
+        obj.__dict__[field.attname] = None
+        self.assertIsNone(field.value_from_object(obj))
+
+    def test_value_to_string_returns_redacted_placeholder_when_value_set(self):
+        # dumpdata output: emit the placeholder rather than leaking the
+        # plaintext into a fixture file.
+        field = self._build_field()
+        obj = SimpleNamespace()
+        obj.__dict__[field.attname] = 'real-plaintext'
+        self.assertEqual(field.value_to_string(obj), field.REDACTED)
+
+    def test_value_to_string_returns_empty_when_value_unset(self):
+        field = self._build_field()
+        obj = SimpleNamespace()
+        obj.__dict__[field.attname] = None
+        self.assertEqual(field.value_to_string(obj), '')
+
+    def test_formfield_returns_encrypted_form_field_instance(self):
+        field = self._build_field()
+        form_field = field.formfield()
+        self.assertIsInstance(form_field, EncryptedFormField)
+
+    def test_field_is_editable_by_default(self):
+        # Regression guard: BinaryField (the parent) defaults editable=False.
+        # If we inherit that default, modelform_factory drops the field
+        # silently — or, when explicitly named in Meta.fields, raises
+        # FieldError before formfield() is ever called. UpdateView /
+        # ModelForm consumers must see editable=True for the field to
+        # participate in forms.
+        self.assertTrue(self._build_field().editable)
+
+    def test_to_python_passes_keep_existing_sentinel_through(self):
+        # Regression guard for a bug found in live testing: ModelForm's
+        # _post_clean runs Model.full_clean, which runs Model.clean_fields,
+        # which calls setattr(instance, attname, field.clean(raw_value, instance))
+        # on every field. Field.clean calls to_python. If to_python coerces
+        # the sentinel to str(sentinel), that string then replaces the
+        # sentinel on the instance before pre_save ever runs — and the
+        # blank-submission preservation breaks silently. The fix: pass the
+        # sentinel through to_python untouched.
+        field = self._build_field()
+        self.assertIs(field.to_python(_KEEP_EXISTING_VALUE), _KEEP_EXISTING_VALUE)
+
+    def test_field_clean_preserves_keep_existing_sentinel(self):
+        # Integration-level guard for the same regression: exercise the
+        # full Field.clean() pipeline (to_python + validate + run_validators)
+        # that Model.clean_fields invokes during ModelForm._post_clean.
+        field = self._build_field()
+        # model_instance=None is acceptable: Field.validate doesn't dereference
+        # it for nullable/blankable fields with no choices.
+        self.assertIs(field.clean(_KEEP_EXISTING_VALUE, model_instance=None), _KEEP_EXISTING_VALUE)
+
+    def test_get_prep_value_treats_keep_existing_sentinel_as_no_value(self):
+        # Defensive guard for any path that bypasses pre_save and lands the
+        # sentinel in get_prep_value — better to write NULL than to
+        # encrypt str(sentinel) and persist garbage.
+        field = self._build_field()
+        self.assertIsNone(field.get_prep_value(_KEEP_EXISTING_VALUE))
+
+
+class TestEncryptedFormField(TestCase):
+    """Tests for the form-side companion: blank-as-no-change and masked widget."""
+
+    def test_clean_blank_string_returns_keep_existing_sentinel(self):
+        # The footgun guard: a blank submission must signal "preserve
+        # existing", not "set to blank". The model field's pre_save
+        # recognises the sentinel.
+        form_field = EncryptedFormField()
+        self.assertIs(form_field.clean(''), _KEEP_EXISTING_VALUE)
+
+    def test_clean_none_returns_keep_existing_sentinel(self):
+        form_field = EncryptedFormField()
+        self.assertIs(form_field.clean(None), _KEEP_EXISTING_VALUE)
+
+    def test_clean_non_blank_value_passes_through(self):
+        form_field = EncryptedFormField()
+        self.assertEqual(form_field.clean('user-typed-value'), 'user-typed-value')
+
+    def test_has_changed_blank_submission_is_false_even_when_initial_set(self):
+        # Consistent with clean(): ModelForm.changed_data must not flag
+        # the field on a blank submission, otherwise downstream change
+        # tracking sees a spurious edit.
+        form_field = EncryptedFormField()
+        self.assertFalse(form_field.has_changed('existing-secret', ''))
+        self.assertFalse(form_field.has_changed('existing-secret', None))
+
+    def test_has_changed_real_edit_is_true(self):
+        form_field = EncryptedFormField()
+        self.assertTrue(form_field.has_changed('existing-secret', 'new-secret'))
+
+    def test_default_widget_is_clearable_encrypted_input_without_render_value(self):
+        # The composite widget renders the masked input, an eye-toggle
+        # button, and the "Clear" checkbox. render_value=False keeps the
+        # stored secret out of the rendered HTML; this stays true even
+        # though the widget is no longer just a plain PasswordInput.
+        form_field = EncryptedFormField()
+        self.assertIsInstance(form_field.widget, ClearableEncryptedInput)
+        # The subclass relationship is load-bearing — Django form-rendering
+        # paths that special-case PasswordInput continue to work.
+        self.assertIsInstance(form_field.widget, forms.PasswordInput)
+        self.assertFalse(form_field.widget.render_value)
+
+    def test_required_defaults_to_false(self):
+        # The field's purpose is in-place rotation of an existing secret;
+        # required=True would interact badly with blank-as-no-change.
+        form_field = EncryptedFormField()
+        self.assertFalse(form_field.required)
+
+    def test_clean_clear_sentinel_returns_none(self):
+        # The clear path: when the widget signals "user checked Clear",
+        # clean returns None so EncryptedModelField.get_prep_value stores
+        # NULL and the row's value is wiped.
+        form_field = EncryptedFormField()
+        self.assertIsNone(form_field.clean(_CLEAR_EXISTING_VALUE))
+
+    def test_has_changed_clear_submission_is_true(self):
+        # Clearing a stored value IS a change. Returning False here would
+        # cause ModelForm.changed_data to omit the field and skip save,
+        # silently dropping the user's clear request.
+        form_field = EncryptedFormField()
+        self.assertTrue(form_field.has_changed('existing-secret', _CLEAR_EXISTING_VALUE))
+        # Even when there's no initial value, a clear request signals
+        # the user's intent and should be propagated through save().
+        self.assertTrue(form_field.has_changed(None, _CLEAR_EXISTING_VALUE))
+
+
+class TestClearableEncryptedInput(TestCase):
+    """Tests for the composite widget's value_from_datadict precedence rules
+    and the get_context plumbing that the template depends on.
+    """
+
+    def test_value_from_datadict_returns_typed_value_when_typed_and_checkbox_unchecked(self):
+        # The normal "set or rotate" path: user typed a value, no clear.
+        widget = ClearableEncryptedInput()
+        result = widget.value_from_datadict(
+            data={'secret': 'user-typed-value'},
+            files={},
+            name='secret',
+        )
+        self.assertEqual(result, 'user-typed-value')
+
+    def test_value_from_datadict_returns_clear_sentinel_when_empty_and_checkbox_checked(self):
+        # The "clear stored value" path. The companion checkbox key is
+        # the field name suffixed with -clear (mirrors ClearableFileInput).
+        widget = ClearableEncryptedInput()
+        result = widget.value_from_datadict(
+            data={'secret': '', 'secret-clear': 'on'},
+            files={},
+            name='secret',
+        )
+        self.assertIs(result, _CLEAR_EXISTING_VALUE)
+
+    def test_value_from_datadict_typed_value_wins_over_clear_checkbox(self):
+        # Contradictory submission (typed value AND clear checked): resolve
+        # to the typed value. The conservative principle is "don't destroy
+        # data the user just entered" — they may have intended to type and
+        # forgotten to uncheck the box.
+        widget = ClearableEncryptedInput()
+        result = widget.value_from_datadict(
+            data={'secret': 'new-value', 'secret-clear': 'on'},
+            files={},
+            name='secret',
+        )
+        self.assertEqual(result, 'new-value')
+
+    def test_value_from_datadict_returns_empty_string_when_neither_typed_nor_checked(self):
+        # The "preserve existing" path: no typed value, no clear. The form
+        # field then translates this into _KEEP_EXISTING_VALUE in clean.
+        widget = ClearableEncryptedInput()
+        result = widget.value_from_datadict(
+            data={'secret': ''},
+            files={},
+            name='secret',
+        )
+        self.assertEqual(result, '')
+
+    def test_get_context_includes_checkbox_name_and_id(self):
+        # The widget template renders the companion checkbox using these
+        # context keys; missing them would silently break the rendered
+        # markup (no input element submitted under the -clear name).
+        widget = ClearableEncryptedInput()
+        context = widget.get_context(name='secret', value=None, attrs={})
+        self.assertEqual(context['widget']['checkbox_name'], 'secret-clear')
+        self.assertEqual(context['widget']['checkbox_id'], 'id_secret-clear')
+
+    def test_get_context_sets_stored_placeholder_when_value_present(self):
+        # The widget receives the decrypted plaintext as `value` when
+        # rendering a bound form. The placeholder tells the user that a
+        # value is stored WITHOUT revealing it (the stored value never
+        # enters the rendered input's value attribute — render_value=False).
+        widget = ClearableEncryptedInput()
+        context = widget.get_context(name='secret', value='some-plaintext', attrs={})
+        self.assertEqual(
+            context['widget']['attrs']['placeholder'],
+            '(A stored value is hidden) — type to replace',
+        )
+
+    def test_get_context_sets_not_set_placeholder_when_value_absent(self):
+        # For instances with no stored value (or unbound forms), the
+        # placeholder tells the user the field is empty so they know
+        # there is nothing to preserve on blank submit.
+        widget = ClearableEncryptedInput()
+        context = widget.get_context(name='secret', value=None, attrs={})
+        self.assertEqual(
+            context['widget']['attrs']['placeholder'],
+            '(not set) — type to add',
+        )
+
+    def test_get_context_respects_developer_supplied_placeholder(self):
+        # A developer wiring the widget into a non-standard form may want
+        # a custom placeholder (e.g. localised text). The widget's
+        # state-aware default must NOT clobber an explicit attrs override.
+        widget = ClearableEncryptedInput(attrs={'placeholder': 'custom hint'})
+        context = widget.get_context(name='secret', value='some-plaintext', attrs={})
+        self.assertEqual(context['widget']['attrs']['placeholder'], 'custom hint')
+
+
+class TestSecretKeyFallbacks(TestCase):
+    """Tests for graceful SECRET_KEY rotation via SECRET_KEY_FALLBACKS.
+
+    The encryption module's ``decrypt()`` honours SECRET_KEY_FALLBACKS by
+    trying the primary derived key first and then each fallback. This
+    matches Django's own pattern for HMAC signing keys.
+    """
+
+    def test_decrypt_uses_fallback_when_primary_does_not_match(self):
+        # Encrypt under SECRET_KEY=A.
+        with override_settings(SECRET_KEY='A-original'):
+            blob = encryption.encrypt('rotate-me')
+        # Decrypt with new primary B and A in fallbacks → success.
+        with override_settings(SECRET_KEY='B-new', SECRET_KEY_FALLBACKS=['A-original']):
+            self.assertEqual(encryption.decrypt(blob), 'rotate-me')
+
+    def test_decrypt_fails_when_no_key_matches(self):
+        # Encrypt under SECRET_KEY=A.
+        with override_settings(SECRET_KEY='A-only'):
+            blob = encryption.encrypt('will-fail')
+        # Unrelated primary, no fallback → InvalidToken.
+        with override_settings(SECRET_KEY='B-only', SECRET_KEY_FALLBACKS=[]):
+            with self.assertRaises(InvalidToken):
+                encryption.decrypt(blob)
+
+    def test_encrypt_always_uses_primary_not_fallbacks(self):
+        # Encrypt with primary B and A in fallbacks.
+        with override_settings(SECRET_KEY='B-primary', SECRET_KEY_FALLBACKS=['A-fallback']):
+            blob = encryption.encrypt('written-with-primary')
+        # That blob must decrypt under SECRET_KEY=B alone, NOT under A alone.
+        with override_settings(SECRET_KEY='B-primary', SECRET_KEY_FALLBACKS=[]):
+            self.assertEqual(encryption.decrypt(blob), 'written-with-primary')
+        with override_settings(SECRET_KEY='A-fallback', SECRET_KEY_FALLBACKS=[]):
+            with self.assertRaises(InvalidToken):
+                encryption.decrypt(blob)
+
+
+class TestRotateEncryptionKeyCommand(TestCase):
+    """Tests for the ``rotate_encryption_key`` management command.
+
+    The command's load-bearing per-value operation is: read each
+    ``EncryptedModelField`` value through ``decrypt()`` (which tries
+    the primary key first, then each fallback) and write it back
+    through ``encrypt()`` (which always uses the primary). We exercise
+    that pattern directly — there is no Django model in ``tom_common``
+    that uses ``EncryptedModelField``, so we can't run the full command
+    against real data in the test DB. The pattern itself is the same
+    one the command applies row-by-row.
+    """
+
+    def test_decrypt_then_encrypt_makes_data_independent_of_fallback(self):
+        # Encrypt under SECRET_KEY=A (the "old" key).
+        with override_settings(SECRET_KEY='A-old-secret-key'):
+            blob = encryption.encrypt('migrate-me-forward')
+
+        # Post-rotation state: primary is B, A is in fallbacks. The
+        # command's per-value action is decrypt-then-encrypt.
+        with override_settings(SECRET_KEY='B-new-secret-key',
+                               SECRET_KEY_FALLBACKS=['A-old-secret-key']):
+            plaintext = encryption.decrypt(blob)
+            re_encrypted = encryption.encrypt(plaintext)
+
+        # The re-encrypted blob must decrypt under SECRET_KEY=B alone —
+        # i.e. the data is no longer fallback-dependent.
+        with override_settings(SECRET_KEY='B-new-secret-key',
+                               SECRET_KEY_FALLBACKS=[]):
+            self.assertEqual(encryption.decrypt(re_encrypted), 'migrate-me-forward')
+
+    def test_command_runs_clean_when_no_encrypted_data_exists(self):
+        """Smoke test: with no models in INSTALLED_APPS that use
+        EncryptedModelField (the situation for tom_base's own test
+        suite), the command should exit cleanly with a zero-count
+        summary.
+        """
+        out = StringIO()
+        call_command('rotate_encryption_key', stdout=out)
+        output = out.getvalue()
+        self.assertIn('Re-encrypted 0 value(s) under the primary cipher.', output)
+        self.assertIn('SECRET_KEY_FALLBACKS', output)

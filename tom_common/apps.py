@@ -7,9 +7,20 @@ class TomCommonConfig(AppConfig):
     name = 'tom_common'
 
     def ready(self):
-        # Import signals for automatically saving profiles when updating User objects
+        # Import signals so their @receiver decorators are executed, which
+        # registers the signal handlers. Without this import, signal handlers
+        # in signals.py would never fire.
         # https://docs.djangoproject.com/en/5.1/topics/signals/#connecting-receiver-functions
         import tom_common.signals  # noqa
+
+        # Register system checks (the @register decorators run on import).
+        import tom_common.checks  # noqa
+
+        # So that django.contrib.admin can't avoid django-auth MFA (if configured)
+        from allauth.account.decorators import secure_admin_login  # b/c need models that only exist at runtime
+        from django.contrib import admin
+        admin.autodiscover()
+        admin.site.login = secure_admin_login(admin.site.login)  # route admin logins through the allauth login
 
         # Set default plotly theme on startup
         valid_themes = ['plotly', 'plotly_white', 'plotly_dark', 'ggplot2', 'seaborn', 'simple_white', 'none']
@@ -31,4 +42,6 @@ class TomCommonConfig(AppConfig):
         Typically, this partial will be a bootstrap card displaying some app specific user data.
         """
         return [{'partial': 'tom_common/partials/user_data.html',
-                 'context': 'tom_common.templatetags.user_extras.user_data'}]
+                 'context': 'tom_common.templatetags.user_extras.user_data'},
+                {'partial': 'tom_common/partials/security_card.html',
+                 'context': 'tom_common.templatetags.user_extras.security_card'}]

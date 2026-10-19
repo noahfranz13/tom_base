@@ -1,44 +1,27 @@
+from tom_targets.base_models import get_target_model_app_label, BaseTarget
 import requests
 
 from django.conf import settings
 from django.core.exceptions import ImproperlyConfigured
 
 from tom_targets.serializers import TargetSerializer
-from tom_targets.models import PersistentShare
-from tom_dataproducts.sharing import (check_for_share_safe_datums, share_data_with_tom,
+from tom_targets.models import PersistentShare, get_target_model_class
+from tom_dataproducts.sharing import (share_data_with_tom,
                                       get_destination_target, sharing_feedback_converter)
-from tom_dataproducts.models import ReducedDatum
-from tom_dataproducts.alertstreams.hermes import publish_to_hermes, BuildHermesMessage
 
 
-def share_target_and_all_data(share_destination, target):
+def share_target_and_all_data(share_destination, target, user):
     """
     Given a sharing destination, shares the target and all its current dataproducts
     with that destination. Will raise an Exception is any portion of sharing fails.
     :param share_destination: String sharing destination from the DATA_SHARING setting
     :param target: Target instance that should be shared with all its data
     """
-    if 'HERMES' in share_destination.upper():
-        hermes_topic = share_destination.split(':')[1]
-        destination = share_destination.split(':')[0]
-        filtered_reduced_datums = check_for_share_safe_datums(
-            destination, ReducedDatum.objects.filter(target=target), topic=hermes_topic)
-        sharing = getattr(settings, "DATA_SHARING", {})
-        tom_name = f"{getattr(settings, 'TOM_NAME', 'TOM Toolkit')}"
-        message = BuildHermesMessage(title=f"Setting up continuous sharing for {target.name} from "
-                                     f"{tom_name}.",
-                                     authors=sharing.get('hermes', {}).get('DEFAULT_AUTHORS', None),
-                                     submitter='',
-                                     message='',
-                                     topic=hermes_topic
-                                     )
-        return sharing_feedback_converter(publish_to_hermes(message, filtered_reduced_datums))
-    else:
-        response = share_target_with_tom(share_destination, {'target': target})
-        response_feedback = sharing_feedback_converter(response)
-        if 'ERROR' in response_feedback.upper():
-            return response_feedback
-        return sharing_feedback_converter(share_data_with_tom(share_destination, None, target_id=target.id))
+    response = share_target_with_tom(share_destination, {'target': target}, user=user)
+    response_feedback = sharing_feedback_converter(response)
+    if 'ERROR' in response_feedback.upper():
+        return response_feedback
+    return sharing_feedback_converter(share_data_with_tom(share_destination, None, target_id=target.id))
 
 
 def continuous_share_data(target, reduced_datums):
@@ -52,26 +35,24 @@ def continuous_share_data(target, reduced_datums):
     for persistentshare in persistentshares:
         share_destination = persistentshare.destination
         reduced_datum_pks = [rd.pk for rd in reduced_datums]
-        if 'HERMES' in share_destination.upper():
-            hermes_topic = share_destination.split(':')[1]
-            destination = share_destination.split(':')[0]
-            filtered_reduced_datums = check_for_share_safe_datums(
-                destination, ReducedDatum.objects.filter(pk__in=reduced_datum_pks), topic=hermes_topic)
-            sharing = getattr(settings, "DATA_SHARING", {})
-            tom_name = f"{getattr(settings, 'TOM_NAME', 'TOM Toolkit')}"
-            message = BuildHermesMessage(title=f"Updated data for {target.name} from "
-                                         f"{tom_name}.",
-                                         authors=sharing.get('hermes', {}).get('DEFAULT_AUTHORS', None),
-                                         submitter=tom_name,
-                                         message='',
-                                         topic=hermes_topic
-                                         )
-            publish_to_hermes(message, filtered_reduced_datums)
-        else:
-            share_data_with_tom(share_destination, None, None, None, selected_data=reduced_datum_pks)
+        share_data_with_tom(share_destination, None, None, None, selected_data=reduced_datum_pks)
 
 
-def share_target_with_tom(share_destination, form_data, target_lists=()):
+def custom_target_to_extras(target_id) -> list[dict]:
+    target_app_label = get_target_model_app_label()
+    extra_fields = []
+    if target_app_label != 'tom_targets':
+        target = get_target_model_class().objects.get(pk=target_id)
+        for field in target._meta.get_fields():
+            if field not in BaseTarget._meta.get_fields() and field.name not in ['id', 'basetarget_ptr']:
+                value = getattr(target, field.name, None)
+                if value is not None:
+                    extra_fields.append({'key': field.name, 'value': str(value)})
+
+    return extra_fields
+
+
+def share_target_with_tom(share_destination, form_data, target_lists=(), user=None):
     """
     Share a target with a remote TOM.
     :param share_destination: The name of the destination TOM as defined in settings.DATA_SHARING
@@ -110,6 +91,15 @@ def share_target_with_tom(share_destination, form_data, target_lists=()):
     if destination_target_id is None:
         # If target is not in Destination, serialize and create new target.
         serialized_target = TargetSerializer(form_data['target']).data
+        # If the shared target is a custom model custom fields should still be shared.
+        # Because the destination TOM might not have the same fields, we convert them to
+        # target extras.
+        extra_extras = custom_target_to_extras(serialized_target['id'])
+        serialized_target['targetextra_set'].extend(extra_extras)
+        # Basic provenance
+        if user is not None:
+            serialized_target['shared_by'] = user.username
+        serialized_target['shared_from'] = settings.TOM_NAME
         # Remove local User Groups
         serialized_target['groups'] = []
         # Add target lists

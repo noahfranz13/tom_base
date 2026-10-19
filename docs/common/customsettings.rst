@@ -1,5 +1,5 @@
 TOM Specific Settings
----------------------
+=====================
 
 The following is a list of TOM Specific settings to be added/edited in
 your project’s ``settings.py``. For explanations of Django specific
@@ -16,31 +16,6 @@ Determines how your TOM treats unauthenticated users. A value of
 TOM, but not to change anything. A value of **LOCKED** requires all
 users to login before viewing any page. Use the
 `OPEN_URLS <#open-urls>`__ setting for adding exemptions.
-
-`BROKERS <#brokers>`__
-~~~~~~~~~~~~~~~~~~~~~~
-
-Default:
-
-.. code-block::
-
-   {
-        'TNS': {
-           'api_key': ''
-        },
-        'SCIMMA': {
-            'url': 'http://skip.dev.hop.scimma.org',
-            'api_key': os.getenv('SKIP_API_KEY', ''),
-            'hopskotch_url': 'dev.hop.scimma.org',
-            'hopskotch_username': os.getenv('HOPSKOTCH_USERNAME', ''),
-            'hopskotch_password': os.getenv('HOPSKOTCH_PASSWORD', ''),
-            'default_hopskotch_topic': ''
-        }
-   }
-
-Credentials and settings for any brokers that require them. At the moment, the only
-built-in TOM Toolkit broker module that requires credentials is the TNS. SCIMMA and
-ANTARES, which are available as add-on modules, also use this setting.
 
 `DATA_PROCESSORS <#data-processors>`__
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -108,21 +83,6 @@ one you’ll probably have to configure it here first. For example the LCO
 facility requires you to provide a value for the ``api_key``
 configuration value.
 
-`HARVESTERS <#harvesters>`__
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-Default:
-
-.. code-block::
-
-   {
-        'TNS': {
-           'api_key': ''
-        },
-   }
-
-Credentials and settings for any harvesters that require them. At the moment, the only
-built-in TOM Toolkit broker module that requires credentials is the TNS.
 
 `HINTS <#hints>`__
 ~~~~~~~~~~~~~~~~~~
@@ -166,7 +126,8 @@ Default: []
 
 With an `AUTH_STRATEGY <#auth-strategy>`__ value of **LOCKED**, urls in
 this list will remain visible to unauthenticated users. You can also use wild cards to open an entire path.
-You might add the homepage (‘/’), for example, or anything with a path that looks like '/accounts/reset/*/'.
+You might add the homepage (‘/’), for example, or an API path such as ``'/api/*'`` for scripts that authenticate
+with a token. The login, sign-up, second-factor and password-reset pages are open automatically.
 
 `TARGET_PERMISSIONS_ONLY <#target-permissions-only>`__
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -202,44 +163,70 @@ Default:
 Display these columns in the target list table. Values can be attributes or properties on
 the Target model, tags or extra fields. See :doc:`Customizing the Target List Table <../targets/target_table>`.
 
-`TOM_ALERT_CLASSES <#tom-alert-classes>`__
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-Default:
-
-.. code-block::
-
-   [
-       'tom_alerts.brokers.mars.MARSBroker',
-       'tom_alerts.brokers.lasair.LasairBroker',
-       'tom_alerts.brokers.scout.ScoutBroker',
-       'tom_alerts.brokers.tns.TNSBroker',
-       'tom_alerts.brokers.antares.ANTARESBroker',
-       'tom_alerts.brokers.gaia.GaiaBroker'
-   ]
-
-A list of tom alert classes to make available to your TOM. If you have
-written or downloaded additional alert classes you would make them
-available here. If you’d like to write your own alert module please see
-the documentation on :doc:`Creating an Alert Module for the TOM
-Toolkit <../brokers/create_broker>`.
-
-`TOM_ALERT_DASH_CLASSES <#tom-alert-dash-classes>`__
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+`TOM_ACCOUNT_REQUIREMENTS <#tom-account-requirements>`__
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 Default:
 
 .. code-block:: python
 
    [
-      'tom_alerts_dash.brokers.alerce.ALeRCEDashBroker',
-      'tom_alerts_dash.brokers.mars.MARSDashBroker',
+       'tom_common.accounts.requirements.terms_of_service_accepted',
+       'tom_common.accounts.requirements.mfa_enrolled',
+       'tom_common.accounts.requirements.password_not_expired',
+       'tom_common.accounts.requirements.required_fields_present',
    ]
 
-A list of tom alert dash classes to make available to your TOM. If you have
-written or downloaded additional alert classes you would make them
-available here. If you’d like to write your own dash alert module, please see
-the documentation on :doc:`Plotly Dash Broker Modules in the TOM Toolkit <../brokers/create_dash_broker>`.
+Ordered list of checks applied to every request by a logged-in user. Each entry is the dotted path of a check
+*function*; its companion ``TOM_*`` setting is the check's *parameter*. A check whose setting is left unconfigured
+returns ``None`` immediately (no database queries), so the default list is entirely inactive out of the box:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 40 32 28
+
+   * - Check function
+     - Activated by configuring
+     - Unsatisfied users are sent to
+   * - ``terms_of_service_accepted``
+     - ``TOM_TERMS_OF_SERVICE_VERSION``
+     - the terms acceptance page
+   * - ``mfa_enrolled``
+     - ``TOM_MFA_REQUIRED``
+     - two-factor enrolment
+   * - ``password_not_expired``
+     - ``TOM_PASSWORD_EXPIRY_DAYS``
+     - the change-password page
+   * - ``required_fields_present``
+     - ``TOM_REQUIRED_USER_FIELDS``
+     - their user edit page
+
+The checks run on every request rather than only at login so that a change (e.g. a new terms-of-service version, a
+password crossing its expiry age, an administrator removing a user's authenticator) takes effect during
+long-lived sessions instead of at the next login. Every configured requirement also appears as a column on the
+*Users* page so administrators can see who has not yet met it. Add your own check as a dotted path to a function
+taking the request and returning ``None`` or the URL name of the page where the user can satisfy the requirement;
+a custom check may read its own ``settings.py`` value following the same pattern. See
+:doc:`Accounts and Authentication <authentication>`.
+
+`TOM_API_TOKEN_EXPIRY_DAYS <#tom-api-token-expiry-days>`__
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Default: None
+
+When set to a number of days, API tokens older than that are rejected by ``tom_common.accounts.api_auth.TomTokenAuthentication``
+and users must regenerate their token from their profile edit page.
+
+`TOM_API_TOKEN_REQUIRES_MFA <#tom-api-token-requires-mfa>`__
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Default: False
+
+When ``True``, API tokens are only accepted for users who have enabled two-factor authentication (and only tokens
+created after enrolment); the password-only ``/api/token-auth/`` endpoint is disabled and tokens can only be
+regenerated by their owner after re-authenticating. Requires ``tom_common.accounts.api_auth.TomTokenAuthentication`` in
+``REST_FRAMEWORK['DEFAULT_AUTHENTICATION_CLASSES']``. ``manage.py check`` warns (``tom_common.W001``) when either
+token setting is configured without it.
 
 `TOM_FACILITY_CLASSES <#tom-facility-classes>`__
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -260,24 +247,8 @@ A list of observation facility classes to make available to your TOM. If
 you have written or downloaded a custom observation facility you would
 add the class to this list to make your TOM load it.
 
-`TOM_HARVESTER_CLASSES <#tom-harvester-classes>`__
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-Default:
-
-.. code-block
-
-   [
-       'tom_catalogs.harvesters.simbad.SimbadHarvester',
-       'tom_catalogs.harvesters.ned.NEDHarvester',
-       'tom_catalogs.harvesters.jplhorizons.JPLHorizonsHarvester',
-       'tom_catalogs.harvesters.mpc.MPCHarvester',
-       'tom_catalogs.harvesters.tns.TNSHarvester',
-   ]
-
-A list of TOM harverster classes to make available to your TOM. If you
-have written or downloaded additional harvester classes you would make
-them available here.
+INSTALLED_APPS that implement the ``observation_facilities()`` AppConfig integration
+point do not need to be listed here.
 
 `TOM_LATEX_PROCESSORS <#tom-latex-processors>`__
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -295,20 +266,26 @@ A dictionary with the keys being TOM models classes and the values being
 the modules that should be used to generate latex tables for those
 models.
 
-`TOM_REGISTRATION <#tom-registration>`__
+`TOM_HIDE_OTHER_USERS <#tom-hide-other-users>`__
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Default: False
+
+``True`` hides other users' rows on the *Users* page (``/users/``). Each user always sees their own row.
+If a user holds the standard Django *Can view user* permission (``auth.view_user``), they can see all other
+users. Superusers hold every permission, so they always see everyone. This setting affects only the *Users* page.
+Django's standard permission mechanism grants ``auth.view_user`` model-wide; ``django-guardian`` can also grant
+the same permission on specific users (an object-level permission). The viewer then sees their own row and just
+those users.
+
+`TOM_MFA_REQUIRED <#tom-mfa-required>`__
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 Default: None
 
-Example:
-
-.. code-block
-
-   {
-      'REGISTRATION_AUTHENTICATION_BACKEND': 'django.contrib.auth.backends.ModelBackend',
-      'REGISTRATION_REDIRECT_PATTERN': 'home',
-      'SEND_APPROVAL_EMAILS': True
-   }
+``'all'`` requires every user (including superusers) to enroll an authenticator app before using the TOM;
+``'superusers'`` requires it only for superusers. Two-factor authentication is always *available* to users; this
+setting only makes it mandatory.
 
 `TOM_NAME <#tom-name>`__
 ~~~~~~~~~~~~~~~~~~~~~~~~
@@ -316,4 +293,56 @@ Example:
 Default: TOM Toolkit
 
 Set the name of the TOM, used for display purposes such as the navbar
-and page titles.
+and page titles, and as the issuer shown in authenticator apps.
+
+`TOM_PASSWORD_EXPIRY_DAYS <#tom-password-expiry-days>`__
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Default: None
+
+When set to a number of days, users whose password is older than that must change it before continuing. A password
+set by an administrator counts as expired. Password *rules* are configured with Django's ``AUTH_PASSWORD_VALIDATORS``
+(see :doc:`Accounts and Authentication <authentication>`).
+
+`TOM_PASSWORD_RESET_ENABLED <#tom-password-reset-enabled>`__
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Default: False
+
+Enables password reset by email (``/accounts/password/reset/`` and a *Forgot your password?* link on the login
+page). Requires a working ``EMAIL_BACKEND``.
+
+`TOM_REGISTRATION <#tom-registration>`__
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Deprecated. This dictionary configured the ``tom_registration`` plugin; use ``TOM_REGISTRATION_STRATEGY`` instead
+(see :doc:`Updating your TOM <../introduction/updating>`).
+
+`TOM_REGISTRATION_STRATEGY <#tom-registration-strategy>`__
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Default: None
+
+``None``: only administrators create accounts. ``'open'``: visitors can sign up and are logged in immediately.
+``'approval_required'``: visitors can sign up; the account stays inactive until a superuser approves it on the
+*Users* page. New users join the ``Public`` group. Notification emails are sent when an email backend is configured.
+
+`TOM_REQUIRED_USER_FIELDS <#tom-required-user-fields>`__
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Default: []
+
+Example: ``['first_name', 'last_name', 'email', 'affiliation', 'phone_number']``
+
+Fields a user account must have. They are required on the sign-up and user edit forms, and a logged-in user with a
+required field missing is taken to their edit page until it is filled in.
+
+`TOM_TERMS_OF_SERVICE_VERSION <#tom-terms-of-service-version>`__
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Default: None
+
+Example: ``'2026-09-01'``
+
+When set, users must accept the terms of service (the template ``tom_common/partials/terms_of_service_text.html``)
+before using the TOM; acceptance of each version is recorded. Change the value to require re-acceptance.

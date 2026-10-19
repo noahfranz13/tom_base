@@ -14,19 +14,19 @@ from tom_targets.models import Target
 class AtlasForcedPhotometryQueryForm(stds.BaseSingleTargetDataServiceQueryForm):
     min_date = forms.CharField(
         label='Min date:', required=False,
-        widget=forms.TextInput(attrs={'class': 'ml-2', 'type': 'datetime-local'})
+        widget=forms.TextInput(attrs={'class': 'ms-2', 'type': 'datetime-local'})
     )
     max_date = forms.CharField(
         label='Max date:', required=False,
-        widget=forms.TextInput(attrs={'class': 'ml-2', 'type': 'datetime-local'})
+        widget=forms.TextInput(attrs={'class': 'ms-2', 'type': 'datetime-local'})
     )
     min_date_mjd = forms.FloatField(
         label='Min date (mjd):', required=False,
-        widget=forms.NumberInput(attrs={'class': 'ml-2'})
+        widget=forms.NumberInput(attrs={'class': 'ms-2'})
     )
     max_date_mjd = forms.FloatField(
         label='Max date (mjd):', required=False,
-        widget=forms.NumberInput(attrs={'class': 'ml-2'})
+        widget=forms.NumberInput(attrs={'class': 'ms-2'})
     )
     # This link highlights the most relevent help information
     reduced_data_help_link = 'https://fallingstar-data.com/forcedphot/faq/#:~:text=you%20may%20also%20encounter%20' \
@@ -148,12 +148,14 @@ class AtlasForcedPhotometryService(stds.BaseSingleTargetDataService):
         if default_task_backend.supports_get_result:
             return True
         else:
-            query_succeeded = result.status == ResultStatus.SUCCEEDED
-            if not query_succeeded:
+            if not result.status == ResultStatus.SUCCEEDED:
                 raise stds.SingleTargetDataServiceException(
                     "Atlas query failed, check the server logs for more information"
                 )
-            self.success_message = "Atlas query completed. View its data product in the 'Manage Data' tab"
+            elif not result._return_value:
+                self.success_message = "Atlas query completed with no results."
+            else:
+                self.success_message = "Atlas query completed. View its data product in the 'Manage Data' tab."
 
         return True
 
